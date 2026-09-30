@@ -39,12 +39,12 @@ func TestRunTurnProbeLocal(t *testing.T) {
 	defer srv.Close()
 
 	var out bytes.Buffer
-	err = RunTurnProbe(context.Background(), "", &TurnProbeCreds{User: "u", Pass: "pass", Addrs: []string{pc.LocalAddr().String()}}, &out)
+	err = RunTurnProbe(context.Background(), "", &TurnProbeCreds{User: "u", Pass: "pass", Addrs: []string{pc.LocalAddr().String()}}, TurnProbeOptions{Quick: true}, &out)
 	t.Log("\n" + out.String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out.String(), "ОШИБКА") || !strings.Contains(out.String(), "wdtt-current     5/5") {
+	if strings.Contains(out.String(), "ОШИБКА") || strings.Count(out.String(), " 5/") < 38 || strings.Contains(out.String(), "потери 1") {
 		t.Fatal("проба не прошла на локальном TURN")
 	}
 }

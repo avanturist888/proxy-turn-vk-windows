@@ -49,7 +49,7 @@ func main() {
 	go func() { <-sig; cancel() }()
 
 	fmt.Fprintf(out, "turnprobe %s\n", time.Now().Format(time.RFC3339))
-	if err := core.RunTurnProbe(ctx, hashes[0], nil, out); err != nil {
+	if err := core.RunTurnProbe(ctx, hashes[0], nil, core.TurnProbeOptions{}, out); err != nil {
 		fmt.Fprintf(out, "ОШИБКА: %v\n", err)
 	}
 	fmt.Fprintln(out, "\nГотово. Результат сохранён в turnprobe.log")
