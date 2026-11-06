@@ -28,7 +28,7 @@ import { tunnelStore } from '../lib/stores/tunnelStore';
 import { toastStore } from '../lib/stores/toastStore';
 import { wdttLinkStore } from '../lib/utils/wdttLink';
 import { stripVkUrl } from '../lib/utils/qwdttParser';
-import { SaveProfile, Connect as WailsConnect, Disconnect as WailsDisconnect, ForceDisconnect, GetVkAuthMode, VkLogin as BackendVkLogin, VkCallJoin, GetExcludeDomains, ListSubscriptions, UpdateSubscription, DeleteSubscription, OpenSubscriptionFolder, GetSubscriptionProfiles } from '../../wailsjs/go/backend/App';
+import { ListProfilesMap, TakeConnectRequest, SaveProfile, Connect as WailsConnect, Disconnect as WailsDisconnect, ForceDisconnect, GetVkAuthMode, VkLogin as BackendVkLogin, VkCallJoin, GetExcludeDomains, ListSubscriptions, UpdateSubscription, DeleteSubscription, OpenSubscriptionFolder, GetSubscriptionProfiles } from '../../wailsjs/go/backend/App';
 import { EventsOn, EventsOff } from '../../wailsjs/runtime/runtime';
 import type { Server, TunnelState, AppSettings, Subscription } from '../lib/types';
 import type { backend } from '../../wailsjs/go/models';
@@ -80,6 +80,49 @@ export default function Tunnel() {
       }
     })();
   }, []);
+  // Профили на диске (profiles/*.json) — источник для консольной утилиты
+  // `wdtt`. Профиль, переименованный на диске, переименовываем и в списке
+  // (по совпадению адреса), а добавленный вне окна — добавляем.
+  const syncDiskProfiles = useCallback(async () => {
+    try {
+      const profs = await ListProfilesMap();
+      if (!profs) return;
+      const all = serverStore.getAll();
+      let changed = false;
+      for (const s of all) {
+        if (s.subscriptionId || profs[s.name]) continue;
+        const match = Object.entries(profs).filter(([n, p]) => p.peer === s.host && !all.some(x => x.name === n));
+        if (match.length === 1) { s.name = match[0][0]; changed = true; }
+      }
+      // Новый профиль получает мощность уже настроенного сервера.
+      const basePower = all.find(s => !s.subscriptionId)?.power ?? 9;
+      for (const [name, p] of Object.entries(profs)) {
+        if (!p.peer || all.some(s => s.name === name)) continue;
+        const clean = (p.hashes || []).map(stripVkUrl).filter(Boolean);
+        all.push({
+          id: crypto.randomUUID(), name, host: p.peer, password: p.password || '',
+          hashes: [clean[0] ?? '', clean[1] ?? '', clean[2] ?? '', clean[3] ?? ''],
+          useGlobalHashes: clean.length === 0, power: basePower,
+        });
+        changed = true;
+      }
+      if (changed) { serverStore.save(all); setServers(serverStore.getAll()); }
+    } catch {
+      // ignore
+    }
+  }, []);
+  useEffect(() => { syncDiskProfiles(); }, [syncDiskProfiles]);
+
+  // Сервер переключили из консоли — показываем его выбранным.
+  useEffect(() => {
+    const off = EventsOn('profile_switched', async (name: unknown) => {
+      await syncDiskProfiles();
+      const s = serverStore.getAll().find(x => x.name === String(name ?? '') && !x.subscriptionId);
+      if (s) { setSelectedId(s.id); selectionStore.set(s.id); }
+    });
+    return () => off();
+  }, [syncDiskProfiles]);
+
   const selected = selectedId ? servers.find(s => s.id === selectedId) ?? null : null;
   const manualServers = servers.filter(s => !s.subscriptionId);
   const setSelected = useCallback((s: Server | null) => {
@@ -161,7 +204,10 @@ export default function Tunnel() {
   }, [settings.linkMode]);
 
   const doConnect = async () => {
-    const cur = selectedRef.current;
+    // Сервер — по id из хранилища на момент вызова: его могли переименовать
+    // (syncDiskProfiles) после последней отрисовки.
+    const sel = selectedRef.current;
+    const cur = sel ? (serverStore.getAll().find(s => s.id === sel.id) ?? sel) : null;
     if (!cur) return;
     const s = settingsStore.get();
     const useGlobal = cur.useGlobalHashes;
@@ -286,6 +332,26 @@ export default function Tunnel() {
       tunnelStore.set('idle');
     }
   };
+
+  // «Подключиться» из трея и подключение при запуске из консоли (`wdtt start`,
+  // пока у бэкенда нет параметров прошлого подключения) — как кнопкой.
+  const doConnectRef = useRef(doConnect);
+  doConnectRef.current = doConnect;
+  useEffect(() => {
+    const off = EventsOn('tray_request_connect', () => {
+      if (tunnelStateRef.current === 'idle' && selectedRef.current) doConnectRef.current();
+    });
+    (async () => {
+      try {
+        if (!(await TakeConnectRequest())) return;
+        await syncDiskProfiles(); // сначала имена профилей с диска
+        if (tunnelStateRef.current === 'idle' && selectedRef.current) doConnectRef.current();
+      } catch {
+        // ignore
+      }
+    })();
+    return () => off();
+  }, [syncDiskProfiles]);
 
   const handleAdd = (data: Omit<Server, 'id'>) => {
     const s = serverStore.add(data);

@@ -27,6 +27,11 @@ var serverBinary []byte
 var trayIcon []byte
 
 func main() {
+	// Без прав администратора туннель не поднять: передаём запуск задаче
+	// планировщика (без UAC) или уже запущенному окну.
+	if backend.HandOffIfNotElevated() {
+		return
+	}
 	backend.InstallCrashLog()
 	backend.Init(deployScript, serverBinary)
 	app := backend.NewApp(trayIcon)
@@ -45,6 +50,10 @@ func main() {
 		OnStartup:        app.Startup,
 		OnShutdown:       app.Shutdown,
 		OnBeforeClose:    app.OnBeforeClose,
+		SingleInstanceLock: &options.SingleInstanceLock{
+			UniqueId:               "wdtt-desktop-3f6c2a1e",
+			OnSecondInstanceLaunch: func(options.SecondInstanceData) { app.OnSecondInstance() },
+		},
 		Bind:             []interface{}{app},
 		Windows: &windows.Options{
 			WebviewIsTransparent: false,

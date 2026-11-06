@@ -22,11 +22,39 @@ import (
 // Параллельно пишет полный лог в файл <config>/wdtt/logs/<session>.log.
 // Буферизует UI-записи и флашит каждые 100ms чтобы не блокировать core.
 type wailsLogWriter struct {
-	ctx  context.Context
-	mu   sync.Mutex
-	buf  []logEntry
-	stop chan struct{}
-	file *os.File
+	ctx       context.Context
+	mu        sync.Mutex
+	buf       []logEntry
+	stop      chan struct{}
+	file      *os.File
+	closeOnce sync.Once
+}
+
+// close останавливает флаш в UI и закрывает файл этой сессии.
+func (w *wailsLogWriter) close() {
+	w.closeOnce.Do(func() {
+		if w.stop != nil {
+			close(w.stop)
+		}
+		w.mu.Lock()
+		if w.file != nil {
+			w.file.Close()
+			w.file = nil
+		}
+		w.mu.Unlock()
+	})
+}
+
+func (w *wailsLogWriter) path() string {
+	if w == nil {
+		return ""
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return ""
+	}
+	return w.file.Name()
 }
 
 type logEntry struct{ level, msg string }
@@ -86,13 +114,13 @@ func (w *wailsLogWriter) Write(p []byte) (int, error) {
 	}
 	level := classifyLevel(msg)
 
+	w.mu.Lock()
 	// Пишем в файл сразу (без буфера)
 	if w.file != nil {
 		ts := time.Now().Format("15:04:05")
 		fmt.Fprintf(w.file, "[%s] [%s] %s\n", ts, level, msg)
 	}
 
-	w.mu.Lock()
 	if len(w.buf) >= maxLogBuf {
 		w.buf = w.buf[1:]
 	}
@@ -237,6 +265,8 @@ type coreSession struct {
 
 	params      ConnectParams // для автопереподключения
 	isReconnect bool          // сессия поднята автопереподключением
+	peer        string        // адрес сервера этой сессии
+	lw          *wailsLogWriter // лог этой сессии: закрывает только её teardown
 	userStop    atomic.Bool   // остановлена пользователем (Disconnect/выход)
 	fatal       atomic.Bool   // фатальная ошибка авторизации — не переподключаемся
 	wasUp       atomic.Bool   // туннель хотя бы раз дошёл до wg_up
@@ -481,6 +511,12 @@ type Orchestrator struct {
 	reconnectTimer   *time.Timer
 	reconnectPending bool
 	reconnectAttempt int
+	reconnectProfile string // профиль ожидающего переподключения (для статуса)
+
+	// lastParams — параметры последнего подключения по кнопке или из
+	// консоли; по ним консольная утилита переключает сервер, не дожидаясь UI.
+	lastParams    ConnectParams
+	hasLastParams bool
 }
 
 // Параметры backoff автопереподключения.
@@ -514,7 +550,11 @@ func (o *Orchestrator) Start(p ConnectParams) error {
 	o.mu.Lock()
 	o.reconnectAttempt = 0
 	o.mu.Unlock()
-	return o.start(p, false)
+	if err := o.start(p, false); err != nil {
+		return err
+	}
+	o.rememberParams(p)
+	return nil
 }
 
 func (o *Orchestrator) start(p ConnectParams, isReconnect bool) error {
@@ -551,6 +591,12 @@ func (o *Orchestrator) launch(p ConnectParams, isReconnect bool) (*coreSession, 
 	lw := &wailsLogWriter{ctx: o.appCtx, file: newSessionLogFile(p.Profile)}
 	lw.start()
 	log.SetOutput(lw)
+	ok := false
+	defer func() {
+		if !ok { // сессия не поднялась — её лог больше никому не нужен
+			o.releaseLog(lw)
+		}
+	}()
 
 	var prof *ProfileData
 	if p.PeerAddr != "" {
@@ -648,7 +694,8 @@ func (o *Orchestrator) launch(p ConnectParams, isReconnect bool) (*coreSession, 
 		return nil, fmt.Errorf("core start: %w", err)
 	}
 
-	sess := &coreSession{c: c, doneCh: events, done: make(chan struct{}), params: p, isReconnect: isReconnect}
+	sess := &coreSession{c: c, doneCh: events, done: make(chan struct{}), params: p, isReconnect: isReconnect, peer: prof.PeerAddr, lw: lw}
+	ok = true
 	o.mu.Lock()
 	// Остановка по ошибке схемы — не «по кнопке»: для reconnect-сессий
 	// она приведёт к следующей попытке с backoff.
@@ -761,21 +808,19 @@ func (o *Orchestrator) forwardEvents(sess *coreSession) {
 			runtime.EventsEmit(o.appCtx, "event", ev.Name, ev.Data)
 		}
 	}
-	// Канал закрыт — core завершился
-	core.TeardownWindowsWireGuard()
-	if lw, ok := log.Writer().(*wailsLogWriter); ok {
-		select {
-		case <-lw.stop:
-		default:
-			close(lw.stop)
-		}
-		if lw.file != nil {
-			lw.file.Close()
-		}
+	// Канал закрыт — core завершился.
+	// stopSession по таймауту обнуляет o.sess раньше, чем мы сюда дойдём, и
+	// к этому моменту может работать уже следующая сессия (переподключение,
+	// переключение сервера). Тогда снимать WG нельзя — это её интерфейс, а
+	// закрывать можно только свой лог: раньше здесь закрывался log.Writer(),
+	// то есть лог новой сессии, и она писала в никуда (пустые файлы логов).
+	o.mu.Lock()
+	newer := o.sess != nil && o.sess != sess
+	o.mu.Unlock()
+	if !newer {
+		core.TeardownWindowsWireGuard()
 	}
-	if o.prevLogWriter != nil {
-		log.SetOutput(o.prevLogWriter)
-	}
+	o.releaseLog(sess.lw)
 	ts := time.Now().Format("15:04:05")
 	runtime.EventsEmit(o.appCtx, "log", "INFO", fmt.Sprintf("[%s] Сессия завершена", ts))
 	runtime.EventsEmit(o.appCtx, "log", "INFO", "[СОСТОЯНИЕ] Туннель остановлен")
@@ -813,6 +858,7 @@ func (o *Orchestrator) scheduleReconnect(sess *coreSession) bool {
 	}
 
 	o.mu.Lock()
+	o.reconnectProfile = sess.params.Profile
 	if sess.wasUp.Load() && time.Since(time.Unix(sess.upAt.Load(), 0)) > reconnectStableAfter {
 		o.reconnectAttempt = 0
 	}

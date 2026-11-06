@@ -29,6 +29,8 @@ type App struct {
 	trayIcon    []byte
 	closeAction atomic.Value // string: "ask" / "hide" / "exit"
 	allowExit   atomic.Bool  // одноразовый флаг для runtime.Quit без remember
+
+	uiConnectRequested atomic.Bool // подключиться из окна при его загрузке (см. TakeConnectRequest)
 }
 
 func NewApp(trayIcon []byte) *App {
@@ -47,7 +49,18 @@ func (a *App) Startup(ctx context.Context) {
 	a.restoreSettings()
 	a.orch = NewOrchestrator(ctx, a.onTrayUpdate)
 	a.startTrayIfNeeded()
+	a.startControl()
 	go a.checkUpdateBackground()
+}
+
+// OnSecondInstance — приложение запустили ещё раз: показываем окно этого
+// экземпляра вместо второго (два экземпляра делили бы один WG-интерфейс).
+func (a *App) OnSecondInstance() {
+	if a.ctx == nil {
+		return
+	}
+	runtime.WindowShow(a.ctx)
+	runtime.WindowUnminimise(a.ctx)
 }
 
 // restoreSettings loads persisted settings and applies them to core / UI state.
