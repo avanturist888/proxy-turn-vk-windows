@@ -95,6 +95,11 @@ func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) 
 
 func (d *Dispatcher) Shutdown() {
 	d.cancel()
+	// readLoop висит в ReadFrom без дедлайна и проверяет ctx только после
+	// пакета, а localConn закрывается уже после Shutdown. Когда WG-интерфейс
+	// снят, на порт никто не пишет — будим чтение сами, иначе ждём вечно
+	// (ядро не завершится, порт останется занят, автопереподключения не будет).
+	_ = d.localConn.SetReadDeadline(time.Now())
 	d.wg.Wait()
 }
 
