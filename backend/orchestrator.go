@@ -294,9 +294,12 @@ type pipelineController struct {
 
 // dtlsFailuresBeforeFatal — сколько провалов DTLS-хендшейка (до первого
 // успешного) считаем признаком неверного пароля/недоступного сервера.
-// Один провал может быть транзиентным (потеря UDP), два подряд при
-// одновременных попытках нескольких воркеров — уже вряд ли.
-const dtlsFailuresBeforeFatal = 2
+// Провалы бывают массовыми и при верном пароле: если путь между частью
+// relay-аллокаций VK и сервером мёртв, таймаутит каждая такая аллокация,
+// пока воркеры не наберут живые (см. deadRelayFastRetries в core). 12
+// провалов при 3 параллельных хендшейках по 8с — это ~30с, сопоставимо с
+// таймаутом этапа DTLS.
+const dtlsFailuresBeforeFatal = 12
 
 func newPipelineController(stopFunc func()) *pipelineController {
 	ctx, cancel := context.WithCancel(context.Background())

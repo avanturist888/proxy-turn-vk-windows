@@ -190,6 +190,7 @@ func WorkerGroup(
 
 			shouldGetConfig := getConfig
 			attempt := 0
+			deadRelayStreak := 0 // подряд таймаутов DTLS-хендшейка (см. deadRelayFastRetries)
 
 			for {
 				if ctx.Err() != nil {
@@ -235,6 +236,13 @@ func WorkerGroup(
 					attempt = 0
 				}
 
+				handshakeTimedOut := sessErr != nil && isHandshakeTimeout(sessErr)
+				if handshakeTimedOut {
+					deadRelayStreak++
+				} else {
+					deadRelayStreak = 0
+				}
+
 				if sessErr != nil {
 					if ctx.Err() != nil {
 						return
@@ -273,7 +281,12 @@ func WorkerGroup(
 						return
 					}
 
-					attempt++
+					// Таймаут хендшейка при живых кредах и TURN — обычно мёртвый
+					// путь relay ↔ сервер для этой аллокации (см.
+					// deadRelayFastRetries), backoff не наращиваем.
+					if !handshakeTimedOut || deadRelayStreak > deadRelayFastRetries {
+						attempt++
+					}
 					if turnAllocAttrMissing {
 						log.Printf("[ВОРКЕР #%d] [TURN] Allocate вернул неполный ответ, обновляем TURN-креды и повторяем (попытка %d): %s", wid, attempt, errStr)
 						refreshCreds("TURN Allocate attribute-not-found")
@@ -307,6 +320,10 @@ func WorkerGroup(
 					base = 30
 				}
 				retryDelay := time.Duration(base)*time.Second + time.Duration(rand.Intn(3))*time.Second
+				if handshakeTimedOut && deadRelayStreak <= deadRelayFastRetries {
+					retryDelay = 300*time.Millisecond + time.Duration(rand.Intn(500))*time.Millisecond
+					log.Printf("[ВОРКЕР #%d] Сервер не ответил через relay — берём новую аллокацию (%d/%d)", wid, deadRelayStreak, deadRelayFastRetries)
+				}
 				select {
 				case <-time.After(retryDelay):
 				case <-ctx.Done():

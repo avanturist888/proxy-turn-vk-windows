@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -25,7 +26,19 @@ const (
 	socketBufSize      = 625 * 1024
 	keepaliveByte      = 0xFF // DTLS-level keepalive marker
 	keepaliveInterval  = 10 * time.Second
-	dtlsHandshakeTimeout = 20 * time.Second // медленный WG успеет договориться
+	// dtlsHandshakeTimeout — через relay здоровый хендшейк занимает ~0.1–0.3 с
+	// (с запасом на ретрансмиты DTLS на лоссовых сетях — несколько секунд).
+	// Бывает, что путь между конкретной аллокацией и сервером мёртв
+	// (частичная потеря маршрута между сетью VK и хостером: пропадает часть
+	// потоков по 5-tuple), и тогда ответа не будет никогда — выгоднее быстро
+	// бросить аллокацию и взять новую с другим relay-портом.
+	dtlsHandshakeTimeout = 8 * time.Second
+
+	// deadRelayFastRetries — сколько таймаутов хендшейка подряд воркер
+	// повторяет почти без паузы (новая аллокация → другой путь). Дальше —
+	// обычный exponential backoff: если сервер реально недоступен или пароль
+	// неверный, не долбим VK аллокациями.
+	deadRelayFastRetries = 6
 
 	// sessionDeadAfter — если за это время через DTLS не пришло НИ ОДНОГО
 	// пакета (ни данных, ни pong на keepalive), сессия считается мёртвой и
@@ -42,6 +55,17 @@ const (
 	// чем отдать право запроса другому воркеру.
 	configRequestAttempts = 3
 )
+
+// isHandshakeTimeout — сессия упала на таймауте DTLS-хендшейка (TURN и
+// креды при этом в порядке).
+func isHandshakeTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "wrap_auth_timeout") ||
+		(strings.Contains(s, "dtls хендшейк") && (strings.Contains(s, "deadline") || strings.Contains(s, "timeout")))
+}
 
 // Handshake semaphore: limit to 3 concurrent DTLS handshakes
 var handshakeSem = make(chan struct{}, 3)
@@ -369,7 +393,7 @@ func RunSession(
 		if useWrap {
 			errStr := strings.ToLower(err.Error())
 			if strings.Contains(errStr, "deadline") || strings.Contains(errStr, "timeout") {
-				log.Printf("[ВОРКЕР #%d] [DTLS] Таймаут хендшейка (15s) с WRAP, пароль/WRAP не подтверждён", sessionID)
+				log.Printf("[ВОРКЕР #%d] [DTLS] Таймаут хендшейка (%v) с WRAP, пароль/WRAP не подтверждён", sessionID, dtlsHandshakeTimeout)
 									emitEvent(Event{Type: EventEvent, Name: "wrap_auth_timeout", Data: fmt.Sprintf("worker=%d", sessionID)})
 				return false, fmt.Errorf("WRAP_AUTH_TIMEOUT: DTLS timeout, пароль/WRAP не подтверждён")
 			}
