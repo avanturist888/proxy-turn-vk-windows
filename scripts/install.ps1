@@ -28,6 +28,10 @@
   Путь к прежней копии wdtt.exe (например, на рабочем столе): она уносится в
   %LOCALAPPDATA%\wdtt\old, а на её месте появляется ярлык.
 
+.PARAMETER AutoStart
+  Включить автозапуск после входа в Windows с подключением к последнему
+  серверу (wdtt.exe --connect).
+
 .PARAMETER Uninstall
   Удалить задачу, ярлыки, запись в PATH и папку установки.
 #>
@@ -36,6 +40,7 @@ param(
     [string]$InstallDir = (Join-Path $env:ProgramFiles 'WDTT'),
     [switch]$Switch,
     [string]$ReplaceOld,
+    [switch]$AutoStart,
     [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
@@ -166,9 +171,9 @@ Remove-RunAsAdminFlags
 
 # Автозапуск (если включён) — на установленную копию.
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-if ((Get-ItemProperty $runKey -ErrorAction SilentlyContinue).WDTT) {
-    Set-ItemProperty $runKey -Name WDTT -Value "`"$guiExe`""
-    Write-Host 'Автозапуск переведён на установленную копию'
+if ($AutoStart -or (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).WDTT) {
+    Set-ItemProperty $runKey -Name WDTT -Value "`"$guiExe`" --connect"
+    Write-Host 'Автозапуск: установленная копия, с подключением'
 }
 
 # 5. Переход на установленную копию.

@@ -4,6 +4,7 @@ package main
 
 import (
 	"embed"
+	"os"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -29,6 +30,7 @@ var trayIcon []byte
 func main() {
 	// Без прав администратора туннель не поднять: передаём запуск задаче
 	// планировщика (без UAC) или уже запущенному окну.
+	backend.RequestConnectIfFlagged(os.Args[1:])
 	if backend.HandOffIfNotElevated() {
 		return
 	}

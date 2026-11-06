@@ -32,6 +32,12 @@ func HandOffIfNotElevated() bool {
 		return false
 	}
 	if _, err := control.Call(control.Request{Cmd: control.CmdShow}, 3*time.Second); err == nil {
+		// Уже запущено. Просьбу подключиться (--connect) передаём сразу —
+		// файл прочитался бы только при следующем запуске.
+		if _, err := os.Stat(control.PendingConnectPath()); err == nil {
+			_ = os.Remove(control.PendingConnectPath())
+			_, _ = control.Call(control.Request{Cmd: control.CmdStart}, 90*time.Second)
+		}
 		return true
 	}
 	exe, err := os.Executable()

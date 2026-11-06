@@ -23,7 +23,8 @@ func SetAutoStart(v bool) error {
 	if err != nil {
 		return err
 	}
-	return k.SetStringValue("WDTT", `"`+exe+`"`)
+	// С --connect после входа в Windows туннель поднимается сам.
+	return k.SetStringValue("WDTT", `"`+exe+`" `+ConnectFlag)
 }
 
 func GetAutoStart() bool {

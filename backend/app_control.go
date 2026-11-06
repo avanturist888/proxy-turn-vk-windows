@@ -23,6 +23,26 @@ func (a *App) startControl() {
 	a.connectIfRequested()
 }
 
+// ConnectFlag — ключ командной строки «подключиться при запуске»: с ним
+// приложение ставит в автозапуск (после входа в Windows туннель
+// поднимается сам, а не только открывается окно).
+const ConnectFlag = "--connect"
+
+// RequestConnectIfFlagged вызывается в main до передачи запуска задаче
+// планировщика (она аргументов не передаёт): ключ --connect превращается в
+// файл-просьбу pending_connect, которую прочитает запущенный экземпляр.
+func RequestConnectIfFlagged(args []string) {
+	for _, a := range args {
+		if a == ConnectFlag {
+			_ = os.MkdirAll(control.ConfigDir(), 0755)
+			if _, err := os.Stat(control.PendingConnectPath()); err != nil {
+				_ = os.WriteFile(control.PendingConnectPath(), nil, 0600)
+			}
+			return
+		}
+	}
+}
+
 // connectIfRequested — консольная утилита запустила приложение с просьбой
 // подключиться (файл pending_connect с именем профиля, пусто — последний).
 func (a *App) connectIfRequested() {
