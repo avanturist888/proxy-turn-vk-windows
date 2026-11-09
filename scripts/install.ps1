@@ -191,6 +191,7 @@ Remove-RunAsAdminFlags
 # Автозапуск (если включён) — на установленную копию.
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 if ($AutoStart -or (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).WDTT) {
+    if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }  # на чистом профиле ключа может не быть
     Set-ItemProperty $runKey -Name WDTT -Value "`"$guiExe`" --connect"
     Write-Host 'Автозапуск: установленная копия, с подключением'
 }
