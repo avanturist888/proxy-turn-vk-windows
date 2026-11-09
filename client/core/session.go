@@ -449,6 +449,14 @@ func RunSession(
 			log.Printf("[ВОРКЕР #%d] Конфиг не получен, право запроса передано другим воркерам", sessionID)
 		}
 	}
+	// Соединение без удачного GETCONF авторизуется отдельно: новый сервер
+	// иначе его закрывает. Если GETCONF дошёл, а ответ потерялся, лишний AUTH
+	// сервер отдаст WireGuard, и тот его отбросит.
+	if !configDelivered {
+		if authErr := SendAuth(dtlsConn, deviceID, password); authErr != nil {
+			return false, authErr
+		}
+	}
 
 	log.Printf("[ВОРКЕР #%d] [READY] Туннель готов к работе ✓", sessionID)
 			emitEvent(Event{Type: EventEvent, Name: "worker_ready", Data: fmt.Sprintf("worker=%d", sessionID)})
@@ -555,6 +563,14 @@ func RunSession(
 			if n == 1 && pkt[0] == keepaliveByte {
 				putPktBuf(pkt)
 				continue
+			}
+
+			// Отказ на AUTH: сервер следом закроет соединение.
+			if reason, denied := deniedReason(pkt[:n]); denied {
+				putPktBuf(pkt)
+				log.Printf("[ВОРКЕР #%d] Сервер отказал в авторизации: %s", sessionID, reason)
+				emitEvent(Event{Type: EventEvent, Name: "auth_denied", Data: fmt.Sprintf("worker=%d reason=%s", sessionID, reason)})
+				return
 			}
 
 			pkt = pkt[:n]

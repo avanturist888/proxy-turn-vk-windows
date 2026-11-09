@@ -74,3 +74,14 @@ func TestExpectsReply(t *testing.T) {
 		t.Error("32-byte non-transport message expects a reply")
 	}
 }
+
+func TestDeniedReason(t *testing.T) {
+	if r, ok := deniedReason([]byte("DENIED:device_mismatch")); !ok || r != "device_mismatch" {
+		t.Fatalf("got %q %v", r, ok)
+	}
+	for _, p := range [][]byte{[]byte("DENIED:"), []byte("READY_OK"), {0x04, 0, 0, 0}, nil} {
+		if _, ok := deniedReason(p); ok {
+			t.Fatalf("%q must not be a denial", p)
+		}
+	}
+}

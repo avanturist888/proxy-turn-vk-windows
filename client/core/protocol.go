@@ -63,5 +63,27 @@ func RequestConfig(conn net.Conn, localPort, deviceID, password string) (string,
 	return resp, nil
 }
 
+// SendAuth — первое сообщение соединения, которое не запрашивало конфиг.
+// Сервер (SpaceNeuroX ≥ 3a003c4) без GETCONF или AUTH соединение закрывает,
+// а AUTH сверяет пароль с ключом WRAP и привязкой устройства. Успех сервер
+// не подтверждает; отказ — строка «DENIED:…» (её ловит Reader сессии).
+// Сервер до 3a003c4 AUTH принимает молча — совместимо с обоими.
+func SendAuth(conn net.Conn, deviceID, password string) error {
+	payload := fmt.Sprintf("AUTH:%s|%s", deviceID, password)
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		return fmt.Errorf("отправка AUTH: %w", err)
+	}
+	return nil
+}
+
+// deniedReason — причина отказа, если пакет от сервера — «DENIED:…».
+func deniedReason(pkt []byte) (string, bool) {
+	const prefix = "DENIED:"
+	if len(pkt) <= len(prefix) || len(pkt) > 128 || string(pkt[:len(prefix)]) != prefix {
+		return "", false
+	}
+	return string(pkt[len(prefix):]), true
+}
+
 
 
