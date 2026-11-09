@@ -8,8 +8,9 @@ import { tunnelStore } from '../lib/stores/tunnelStore';
 import { IsRunning, ForceDisconnect, Version } from '../../wailsjs/go/backend/App';
 
 
-const BUILD_DATE = '31.07.2026';
-const REPO_URL = 'https://github.com/IGOR7276/proxy-turn-vk-windows';
+// Дату ставит сборка релиза (VITE_BUILD_DATE), локально — «dev».
+const BUILD_DATE = import.meta.env.VITE_BUILD_DATE || 'dev';
+const REPO_URL = 'https://github.com/avanturist888/proxy-turn-vk-windows';
 
 export default function Info() {
   const [copied, setCopied] = useState<string | null>(null);

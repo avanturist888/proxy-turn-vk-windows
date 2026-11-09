@@ -18,7 +18,10 @@ import (
 // killOldInstances removed to reduce VirusTotal behavior alerts.
 // See process_windows.go for history.
 
-const appVersion = "2.1.5"
+// appVersion — версия сборки. Релизы форка ставят её из тега:
+// -ldflags "-X wdtt-desktop/backend.appVersion=2.1.6.1" (база upstream +
+// номер сборки форка). Локальная сборка — «…-dev».
+var appVersion = "2.1.6.0-dev"
 
 // App — Wails App, связующее звено между UI и Orchestrator.
 type App struct {

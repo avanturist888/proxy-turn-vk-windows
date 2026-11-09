@@ -20,6 +20,9 @@ type UpdateInfo struct {
 	AssetURL  string `json:"assetUrl,omitempty"`
 }
 
+// releaseRepo — откуда приходят релизы этой сборки (канал выпусков форка).
+const releaseRepo = "avanturist888/proxy-turn-vk-windows"
+
 // CheckUpdate checks GitHub releases for a newer version matching the current OS/arch.
 func (a *App) CheckUpdate() UpdateInfo {
 	return a.checkUpdateGitHub()
@@ -27,7 +30,7 @@ func (a *App) CheckUpdate() UpdateInfo {
 
 func (a *App) checkUpdateGitHub() UpdateInfo {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("GET", "https://api.github.com/repos/IGOR7276/proxy-turn-vk-windows/releases/latest", nil)
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/"+releaseRepo+"/releases/latest", nil)
 	if err != nil {
 		return UpdateInfo{}
 	}
@@ -76,7 +79,7 @@ func (a *App) checkUpdateGitHub() UpdateInfo {
 	return UpdateInfo{
 		Available: true,
 		Version:   latest,
-		URL:       "https://github.com/IGOR7276/proxy-turn-vk-windows/releases/tag/v" + latest,
+		URL:       "https://github.com/" + releaseRepo + "/releases/tag/v" + latest,
 		Body:      release.Body,
 		AssetURL:  assetURL,
 	}
@@ -94,7 +97,7 @@ func updateAssetName() string {
 func isNewerVersion(current, latest string) bool {
 	cur := parseVersion(current)
 	lat := parseVersion(latest)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < len(cur); i++ {
 		if lat[i] > cur[i] {
 			return true
 		}
@@ -105,12 +108,13 @@ func isNewerVersion(current, latest string) bool {
 	return false
 }
 
-func parseVersion(v string) [3]int {
+// parseVersion — до четырёх чисел: 2.1.6 (upstream) и 2.1.6.1 (сборка форка).
+func parseVersion(v string) [4]int {
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
 	parts := strings.SplitN(v, "-", 2)
 	nums := strings.Split(parts[0], ".")
-	var out [3]int
-	for i := 0; i < len(nums) && i < 3; i++ {
+	var out [4]int
+	for i := 0; i < len(nums) && i < len(out); i++ {
 		n, err := strconv.Atoi(nums[i])
 		if err != nil {
 			log.Printf("[Update] failed to parse version component %q: %v", nums[i], err)
