@@ -30,6 +30,7 @@ env:
 
 jobs:
   windows:
+    timeout-minutes: 40
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -172,9 +173,17 @@ jobs:
 
       - name: Smoke test — install, run, uninstall
         shell: pwsh
+        timeout-minutes: 12
         run: |
+          Write-Host '== setup /S'
           $setup = (Resolve-Path dist/out/wdtt-setup-windows-amd64.exe).Path
-          $p = Start-Process $setup -ArgumentList '/S' -Wait -PassThru
+          $log = Join-Path $env:TEMP 'wdtt-install.log'
+          $p = Start-Process $setup -ArgumentList '/S' -PassThru
+          if (-not $p.WaitForExit(300000)) {
+            if (Test-Path $log) { Get-Content $log -Tail 60 }
+            Stop-Process -Id $p.Id -Force; throw 'setup /S не завершился за 5 минут'
+          }
+          if (Test-Path $log) { Get-Content $log -Tail 25 }
           if ($p.ExitCode) { throw "setup /S exit $($p.ExitCode)" }
           $dir = "$env:ProgramFiles\WDTT"
           foreach ($f in 'wdtt.exe', 'cli\wdtt.exe', 'install.ps1', 'uninstall.exe') {
@@ -183,10 +192,13 @@ jobs:
           $task = Get-ScheduledTask -TaskName WDTT -ErrorAction Stop
           if ($task.Actions[0].Execute -ne "$dir\wdtt.exe") { throw "задача запускает $($task.Actions[0].Execute)" }
           if ($task.Principal.RunLevel -ne 'Highest') { throw "задача без наивысших прав" }
+          Write-Host '== cli help / status'
           & "$dir\cli\wdtt.exe" help | Select-Object -First 3
           $st = & "$dir\cli\wdtt.exe" status 2>&1; Write-Host "status (приложение не запущено): $st"
           (Get-Item "$dir\wdtt.exe").VersionInfo | Format-List ProductVersion, FileVersion
-          Start-Process "$dir\uninstall.exe" -ArgumentList '/S' -Wait
+          Write-Host '== uninstall /S'
+          $u = Start-Process "$dir\uninstall.exe" -ArgumentList '/S' -PassThru
+          if (-not $u.WaitForExit(120000)) { throw 'uninstall /S не завершился за 2 минуты' }
           # Деинсталлятор NSIS перезапускает себя из TEMP — ждём результата.
           $deadline = (Get-Date).AddSeconds(90)
           while ((Get-Date) -lt $deadline -and ((Test-Path "$dir\wdtt.exe") -or (Get-ScheduledTask -TaskName WDTT -ErrorAction SilentlyContinue))) { Start-Sleep 2 }

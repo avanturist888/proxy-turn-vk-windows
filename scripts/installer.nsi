@@ -60,7 +60,7 @@ VIAddVersionKey /LANG=0 "LegalCopyright" "GPL-3.0"
 
 Function .onInit
   ${IfNot} ${RunningX64}
-    MessageBox MB_ICONSTOP "WDTT работает только на 64-битной Windows."
+    MessageBox MB_ICONSTOP "WDTT работает только на 64-битной Windows." /SD IDOK
     Abort
   ${EndIf}
   SetRegView 64
@@ -96,10 +96,11 @@ Section "WDTT" SecMain
   SetOutPath "$INSTDIR"
 
   DetailPrint "Регистрирую запуск без UAC, команду wdtt и автозапуск…"
-  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install.ps1" -InPlace -InstallDir "$INSTDIR" -AutoStart'
+  nsExec::ExecToLog /TIMEOUT=180000 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\install.ps1" -InPlace -InstallDir "$INSTDIR" -AutoStart'
   Pop $0
   ${If} $0 != "0"
-    MessageBox MB_ICONEXCLAMATION "Регистрация завершилась с кодом $0. Подробности — в %TEMP%\wdtt-install.log."
+    MessageBox MB_ICONEXCLAMATION "Регистрация завершилась с кодом $0. Подробности — в %TEMP%\wdtt-install.log." /SD IDOK
+    SetErrorLevel 2
   ${EndIf}
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -118,7 +119,7 @@ SectionEnd
 Section "Uninstall"
   !insertmacro StopApp
   DetailPrint "Убираю задачу, ярлыки, PATH и автозапуск…"
-  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install.ps1" -Uninstall -KeepFiles -InstallDir "$INSTDIR"'
+  nsExec::ExecToLog /TIMEOUT=120000 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\install.ps1" -Uninstall -KeepFiles -InstallDir "$INSTDIR"'
   Pop $0
 
   Delete "$INSTDIR\cli\wdtt.exe"
