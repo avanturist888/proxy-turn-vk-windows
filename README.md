@@ -10,6 +10,9 @@
 > SpaceNeuroX до и после 3a003c4 (AUTH). Сборки делает CI из исходников тега, контрольные
 > суммы — в `SHA256SUMS.txt`, политика подписи — [CODE_SIGNING.md](CODE_SIGNING.md).
 > Проверенные изменения уходят в [upstream](https://github.com/IGOR7276/proxy-turn-vk-windows) пулл-реквестами.
+>
+> Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by
+> [SignPath Foundation](https://signpath.org/) — see [CODE_SIGNING.md](CODE_SIGNING.md).
 
 ---
 
