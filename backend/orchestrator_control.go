@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
+
+	"wg-turn-client/core"
 	"wdtt-desktop/control"
 )
 
@@ -98,6 +100,11 @@ func (o *Orchestrator) SwitchTo(name string) error {
 		name = base.Profile
 	}
 	p := paramsForProfile(base, name)
+	// Исключения по доменам — текущий список с диска, а не снимок прошлого
+	// подключения: окно читает их при каждом подключении, консоль — тоже.
+	if domains, err := core.LoadExcludeDomains(configDir()); err == nil {
+		p.ExcludeDomains = domains
+	}
 	if p.PeerAddr == "" {
 		if _, err := loadProfile(name); err != nil {
 			return fmt.Errorf("нет профиля %q", name)
