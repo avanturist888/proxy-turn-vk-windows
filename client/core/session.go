@@ -40,9 +40,11 @@ const (
 	// неверный, не долбим VK аллокациями.
 	deadRelayFastRetries = 6
 
-	// sessionDeadAfter — если за это время через DTLS не пришло НИ ОДНОГО
-	// пакета (ни данных, ни pong на keepalive), сессия считается мёртвой и
-	// закрывается, чтобы воркер переподключился (новый TURN allocate + DTLS).
+	// sessionDeadAfter — если за это время на ушедший через сессию пакет не
+	// пришло НИ ОДНОГО ответного (ни данных, ни pong), сессия считается
+	// мёртвой и закрывается, чтобы воркер переподключился (новый TURN
+	// allocate + DTLS). Простой без трафика смертью не считается —
+	// см. liveness.go.
 	//
 	// Без этого после обрыва сети / смены Wi-Fi / сна ноутбука сессия висела
 	// «живой» до sessionReadTimeout (30 минут): UDP-запись в никуда не
@@ -468,13 +470,12 @@ func RunSession(
 	})
 	defer stopDTLS()
 
-	// lastRx — unix-nano последнего пакета, полученного через DTLS (данные
-	// или pong). Обновляется Reader'ом, проверяется keepalive-горутиной.
-	var lastRx atomic.Int64
-	lastRx.Store(time.Now().UnixNano())
+	// live — что ушло без ответа и когда пришёл последний пакет. Writer и
+	// Reader отмечают, keepalive-горутина проверяет (см. liveness.go).
+	live := newLiveness(time.Now())
 
-	// DTLS Keepalive + liveness: шлём ping, и если ответов (или любых других
-	// пакетов) нет дольше sessionDeadAfter — закрываем сессию. Воркер
+	// DTLS Keepalive + liveness: шлём ping, и если на отправленные пакеты
+	// дольше sessionDeadAfter нет ответа — закрываем сессию. Воркер
 	// переподключится с новой TURN-аллокацией.
 	go func() {
 		defer proxyWg.Done()
@@ -486,8 +487,7 @@ func RunSession(
 			case <-sessCtx.Done():
 				return
 			case <-t.C:
-				silent := time.Since(time.Unix(0, lastRx.Load()))
-				if silent > sessionDeadAfter {
+				if dead, silent := live.dead(time.Now(), sessionDeadAfter); dead {
 					log.Printf("[ВОРКЕР #%d] Нет ответа от сервера %.0fs — сессия мертва, переподключаемся", sessionID, silent.Seconds())
 					emitEvent(Event{Type: EventEvent, Name: "session_dead", Data: fmt.Sprintf("worker=%d silent=%.0fs", sessionID, silent.Seconds())})
 					sessCancel()
@@ -517,6 +517,9 @@ func RunSession(
 				}
 				_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
 				_, writeErr := dtlsConn.Write(pkt)
+				if writeErr == nil {
+					live.sent(pkt, time.Now())
+				}
 				putPktBuf(pkt)
 				if writeErr != nil {
 					log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
@@ -546,7 +549,7 @@ func RunSession(
 				return
 			}
 
-			lastRx.Store(time.Now().UnixNano())
+			live.received(time.Now())
 
 			// Skip keepalive pong from server
 			if n == 1 && pkt[0] == keepaliveByte {
