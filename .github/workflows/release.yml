@@ -70,6 +70,28 @@ jobs:
           Push-Location client; go test ./... ; if ($LASTEXITCODE) { exit 1 }; Pop-Location
           go test -vet=off ./backend ./control ; if ($LASTEXITCODE) { exit 1 }
 
+      # «Деплой VPS» в приложении ставит на сервер встроенные deploy.sh и
+      # wdtt-server. В репозитории wdtt-server — готовый бинарник без сведений
+      # об исходниках; в релиз кладём собранный из исходников SpaceNeuroX того
+      # же коммита, что и встроенный deploy.sh (e657ce4, 2026-05-24).
+      - name: Server for VPS deploy (from source)
+        shell: pwsh
+        env:
+          SERVER_REPO: https://github.com/SpaceNeuroX/proxy-turn-vk-android
+          SERVER_COMMIT: e657ce4dfde624e80d0e61cdda38c58db0bca14d
+        run: |
+          git init -q srv; git -C srv remote add origin $env:SERVER_REPO
+          git -C srv fetch -q --depth 1 origin $env:SERVER_COMMIT; if ($LASTEXITCODE) { exit 1 }
+          git -C srv checkout -q FETCH_HEAD
+          Push-Location srv
+          go mod tidy; if ($LASTEXITCODE) { exit 1 }
+          $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
+          go build -trimpath -ldflags "-s -w" -o ../assets/server/wdtt-server . ; if ($LASTEXITCODE) { exit 1 }
+          Pop-Location
+          Copy-Item srv/app/src/main/assets/deploy.sh assets/server/deploy.sh -Force
+          Remove-Item srv -Recurse -Force
+          Get-Item assets/server/* | Format-Table Name, Length
+
       - name: Build
         shell: pwsh
         env:
@@ -204,6 +226,7 @@ jobs:
           Без установщика: ``wdtt-windows-amd64.zip`` → ``install.ps1``.
 
           $signed
+          Сервер для «Деплой VPS» собран из исходников SpaceNeuroX/proxy-turn-vk-android e657ce4.
           Контрольные суммы — ``SHA256SUMS.txt``.
           "@
           gh release create "v$v" dist/out/* --prerelease --title "WDTT $v" --notes $notes --verify-tag
