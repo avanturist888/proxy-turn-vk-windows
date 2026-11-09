@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration «binaries»: GitHub-артефакт unsigned-binaries
+     (release.yml) — приложение, консольная утилита и скрипт установки. -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="wdtt.exe">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="cli/wdtt.exe">
+      <authenticode-sign />
+    </pe-file>
+    <powershell-file path="install.ps1">
+      <authenticode-sign />
+    </powershell-file>
+  </zip-file>
+</artifact-configuration>
