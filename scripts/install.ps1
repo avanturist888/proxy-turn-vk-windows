@@ -34,6 +34,16 @@
 
 .PARAMETER Uninstall
   Удалить задачу, ярлыки, запись в PATH и папку установки.
+
+.PARAMETER InPlace
+  Файлы уже лежат в InstallDir (их положил установщик setup.exe): не
+  копировать, только зарегистрировать задачу, PATH, ярлыки, автозапуск.
+
+.PARAMETER KeepFiles
+  С -Uninstall: папку установки не удалять (это сделает деинсталлятор).
+
+.PARAMETER Launch
+  После установки запустить приложение (без ожидания подключения).
 #>
 param(
     [string]$Source = (Join-Path $PSScriptRoot '..\build\bin'),
@@ -41,7 +51,10 @@ param(
     [switch]$Switch,
     [string]$ReplaceOld,
     [switch]$AutoStart,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [switch]$InPlace,
+    [switch]$KeepFiles,
+    [switch]$Launch
 )
 $ErrorActionPreference = 'Stop'
 
@@ -121,24 +134,30 @@ if ($Uninstall) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     Set-UserPath $cliDir $false
     Remove-Item $startMenuLnk, $desktopLnk -Force -ErrorAction SilentlyContinue
-    Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name WDTT -ErrorAction SilentlyContinue
+    if (-not $KeepFiles) { Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue }
     Write-Host 'WDTT удалён (настройки и профили в %APPDATA%\wdtt оставлены).'
     Stop-Transcript | Out-Null
     exit 0
 }
 
-$srcGui = Join-Path $Source 'wdtt.exe'
-$srcCli = Join-Path $Source 'cli\wdtt.exe'
-foreach ($f in $srcGui, $srcCli) {
-    if (-not (Test-Path $f)) { throw "Нет файла сборки: $f" }
-}
-
 # 1. Файлы.
-New-Item -ItemType Directory -Force -Path $cliDir | Out-Null
-Get-ChildItem $InstallDir, $cliDir -Filter '*.old-*' -ErrorAction SilentlyContinue |
-    ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
-Install-File $srcGui $guiExe
-Install-File $srcCli $cliExe
+if ($InPlace) {
+    foreach ($f in $guiExe, $cliExe) {
+        if (-not (Test-Path $f)) { throw "Нет файла установки: $f" }
+    }
+} else {
+    $srcGui = Join-Path $Source 'wdtt.exe'
+    $srcCli = Join-Path $Source 'cli\wdtt.exe'
+    foreach ($f in $srcGui, $srcCli) {
+        if (-not (Test-Path $f)) { throw "Нет файла сборки: $f" }
+    }
+    New-Item -ItemType Directory -Force -Path $cliDir | Out-Null
+    Get-ChildItem $InstallDir, $cliDir -Filter '*.old-*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+    Install-File $srcGui $guiExe
+    Install-File $srcCli $cliExe
+}
 Write-Host "Установлено в $InstallDir"
 
 # 2. Задача планировщика: запуск с наивысшими правами без UAC, в сеансе
@@ -205,6 +224,11 @@ if ($Switch) {
         Stop-Transcript | Out-Null
         exit 1
     }
+}
+
+if ($Launch -and -not $Switch) {
+    Start-ScheduledTask -TaskName $taskName
+    Write-Host 'Приложение запущено'
 }
 
 Write-Host ''
