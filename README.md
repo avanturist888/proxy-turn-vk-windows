@@ -4,6 +4,13 @@
 
 Форк [proxy-turn-vk-android](https://github.com/amurcanov/proxy-turn-vk-android) с полностью переписанным десктопным UI на [Wails](https://wails.io).
 
+> **Сборки этого форка** (avanturist888) — [Releases](https://github.com/avanturist888/proxy-turn-vk-windows/releases).
+> Установщик `wdtt-setup-windows-amd64.exe`: один запрос прав администратора, дальше WDTT
+> запускается без UAC, в консоли — команда `wdtt` (`wdtt help`). Совместим с сервером
+> SpaceNeuroX до и после 3a003c4 (AUTH). Сборки делает CI из исходников тега, контрольные
+> суммы — в `SHA256SUMS.txt`, политика подписи — [CODE_SIGNING.md](CODE_SIGNING.md).
+> Проверенные изменения уходят в [upstream](https://github.com/IGOR7276/proxy-turn-vk-windows) пулл-реквестами.
+
 ---
 
 ## Возможности

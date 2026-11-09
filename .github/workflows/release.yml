@@ -1,0 +1,209 @@
+name: Release
+# Выпуск версии форка: тег vA.B.C.N (A.B.C — база upstream, N — номер
+# сборки форка), например v2.1.6.1.
+#
+# Собирает всё из исходников, прогоняет тесты, подписывает (если подключён
+# SignPath), собирает установщик и портативный zip, проверяет установку и
+# удаление на чистом раннере и публикует пре-релиз. Пре-релиз — значит
+# «на обкатке»: проверка обновлений в приложении смотрит только latest,
+# поэтому пользователи увидят версию, когда её сделают latest
+# (gh release edit vA.B.C.N --prerelease=false --latest).
+#
+# Подпись (SignPath Foundation): переменная репозитория
+# SIGNPATH_ORGANIZATION_ID и секрет SIGNPATH_API_TOKEN. Пока их нет — сборка
+# выходит неподписанной, остальное работает так же.
+on:
+  push:
+    tags: ['v*.*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия без «v» (например 2.1.6.1) — для пробной сборки без публикации'
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = if ('${{ github.event_name }}' -eq 'push') { '${{ github.ref_name }}'.TrimStart('v') } else { '${{ inputs.version }}' }
+          if ($v -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "Версия должна быть вида 2.1.6.1, а не '$v'" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "date=$(Get-Date -Format 'dd.MM.yyyy')" >> $env:GITHUB_OUTPUT
+          "publish=$('${{ github.event_name }}' -eq 'push')".ToLower() >> $env:GITHUB_OUTPUT
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Tests
+        shell: pwsh
+        run: |
+          Push-Location client; go test ./... ; if ($LASTEXITCODE) { exit 1 }; Pop-Location
+          go test -vet=off ./backend ./control ; if ($LASTEXITCODE) { exit 1 }
+
+      - name: Build
+        shell: pwsh
+        env:
+          VITE_BUILD_DATE: ${{ steps.ver.outputs.date }}
+          GOFLAGS: -trimpath
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $j = Get-Content wails.json -Raw | ConvertFrom-Json
+          $j.info.productVersion = $v
+          $j | ConvertTo-Json -Depth 10 | Set-Content wails.json -Encoding utf8
+          wails build -platform windows/amd64 -clean -ldflags "-s -w -X wdtt-desktop/backend.appVersion=$v"
+          if ($LASTEXITCODE) { exit 1 }
+          go build -ldflags "-s -w" -o build/bin/cli/wdtt.exe ./cmd/ctl
+          if ($LASTEXITCODE) { exit 1 }
+          New-Item -ItemType Directory -Force dist/app/cli | Out-Null
+          Copy-Item build/bin/wdtt.exe dist/app/
+          Copy-Item build/bin/cli/wdtt.exe dist/app/cli/
+          Copy-Item scripts/install.ps1 dist/app/
+
+      # ── Подпись exe (SignPath) ──
+      - name: Upload unsigned binaries
+        if: env.SIGN == 'true'
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-binaries
+          path: dist/app/
+      - name: Sign binaries
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'proxy-turn-vk-windows' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: binaries
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/app
+
+      - name: Package
+        id: pkg
+        shell: pwsh
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          New-Item -ItemType Directory -Force dist/out | Out-Null
+          Compress-Archive -Path dist/app/* -DestinationPath dist/out/wdtt-windows-amd64.zip -Force
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            $nsis = "${env:ProgramFiles(x86)}\NSIS"
+            if (-not (Test-Path "$nsis\makensis.exe")) { choco install nsis -y --no-progress; if ($LASTEXITCODE) { exit 1 } }
+            $env:PATH = "$nsis;$env:PATH"
+          }
+          $src = (Resolve-Path dist/app).Path
+          $out = Join-Path (Resolve-Path dist/out).Path 'wdtt-setup-windows-amd64.exe'
+          makensis /V2 "/DVERSION=$v" "/DSRCDIR=$src" "/DOUTFILE=$out" scripts/installer.nsi
+          if ($LASTEXITCODE) { exit 1 }
+
+      # ── Подпись установщика (SignPath) ──
+      - name: Upload unsigned installer
+        if: env.SIGN == 'true'
+        id: unsigned_setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer
+          path: dist/out/wdtt-setup-windows-amd64.exe
+      - name: Sign installer
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'proxy-turn-vk-windows' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.unsigned_setup.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/out
+
+      - name: Smoke test — install, run, uninstall
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path dist/out/wdtt-setup-windows-amd64.exe).Path
+          $p = Start-Process $setup -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode) { throw "setup /S exit $($p.ExitCode)" }
+          $dir = "$env:ProgramFiles\WDTT"
+          foreach ($f in 'wdtt.exe', 'cli\wdtt.exe', 'install.ps1', 'uninstall.exe') {
+            if (-not (Test-Path "$dir\$f")) { throw "нет $dir\$f" }
+          }
+          $task = Get-ScheduledTask -TaskName WDTT -ErrorAction Stop
+          if ($task.Actions[0].Execute -ne "$dir\wdtt.exe") { throw "задача запускает $($task.Actions[0].Execute)" }
+          if ($task.Principal.RunLevel -ne 'Highest') { throw "задача без наивысших прав" }
+          & "$dir\cli\wdtt.exe" help | Select-Object -First 3
+          $st = & "$dir\cli\wdtt.exe" status 2>&1; Write-Host "status (приложение не запущено): $st"
+          (Get-Item "$dir\wdtt.exe").VersionInfo | Format-List ProductVersion, FileVersion
+          Start-Process "$dir\uninstall.exe" -ArgumentList '/S' -Wait
+          # Деинсталлятор NSIS перезапускает себя из TEMP — ждём результата.
+          $deadline = (Get-Date).AddSeconds(90)
+          while ((Get-Date) -lt $deadline -and ((Test-Path "$dir\wdtt.exe") -or (Get-ScheduledTask -TaskName WDTT -ErrorAction SilentlyContinue))) { Start-Sleep 2 }
+          if (Get-ScheduledTask -TaskName WDTT -ErrorAction SilentlyContinue) { throw 'задача осталась после удаления' }
+          if (Test-Path "$dir\wdtt.exe") { throw 'файлы остались после удаления' }
+          Write-Host 'Установка и удаление — OK'
+          $global:LASTEXITCODE = 0   # status выше ожидаемо вернул ошибку
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Push-Location dist/out
+          Get-ChildItem -File | Where-Object Name -ne SHA256SUMS.txt | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Set-Content SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+          Pop-Location
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdtt-windows-${{ steps.ver.outputs.version }}
+          path: dist/out/
+
+      - name: Publish pre-release
+        if: steps.ver.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $signed = if ($env:SIGN -eq 'true') { 'Подписано SignPath Foundation.' } else { 'Сборка не подписана: Windows может показать SmartScreen («Подробнее» → «Выполнить в любом случае»).' }
+          $notes = @"
+          WDTT $v — сборка форка avanturist888 из исходников этого тега.
+
+          **Установка:** скачайте ``wdtt-setup-windows-amd64.exe`` и запустите (один запрос прав администратора). Дальше WDTT запускается без UAC, в консоли доступна команда ``wdtt``.
+          Без установщика: ``wdtt-windows-amd64.zip`` → ``install.ps1``.
+
+          $signed
+          Контрольные суммы — ``SHA256SUMS.txt``.
+          "@
+          gh release create "v$v" dist/out/* --prerelease --title "WDTT $v" --notes $notes --verify-tag
