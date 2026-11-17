@@ -86,7 +86,7 @@ func init() {
 type captiveVerdict int
 
 const (
-	captiveUnknown captiveVerdict = iota // network does not answer — portal not confirmed
+	captiveUnknown captiveVerdict = iota // сеть не отвечает — портал не подтверждён
 	captiveOpen                          // probe answered as expected — there is internet
 	captivePortal                        // probe intercepted — captive portal
 )
@@ -330,14 +330,18 @@ func (cw *captiveWatcher) probe() {
 		cw.mu.Unlock()
 		return
 	}
-	cw.lastProbe = time.Now()
 	wasActive := cw.active
+	firstProbe := cw.lastProbe.IsZero()
+	cw.lastProbe = time.Now()
 	cw.mu.Unlock()
 
 	switch verdict {
 	case captiveOpen:
+		if firstProbe {
+			log.Printf("[CAPTIVE] Первая проба сети (%s via %s): портал не обнаружен", iface, gw)
+		}
 		if wasActive {
-			log.Printf("[CAPTIVE] Network released — internet is there, allowing the tunnel to come up")
+			log.Printf("[CAPTIVE] Сеть освобождена — интернет есть, правила сняты, туннель может подниматься")
 			cw.clearAllow()
 			cw.mu.Lock()
 			cw.active = false
@@ -348,11 +352,11 @@ func (cw *captiveWatcher) probe() {
 	case captivePortal:
 		cw.enterCaptive(gw, iface, portalHost, wasActive)
 	default:
-		// The network does not answer: the portal is not confirmed, the allow rules
-		// are not needed. We keep the state; the next check is on a network change
-		// or a core restart (orchestrator reconnect).
+		// Сеть не отвечает: портал не подтверждён, allow-правила не нужны.
+		// Состояние сохраняем; следующая проверка — при смене сети или
+		// рестарте ядра (reconnect оркестратора).
 		if !wasActive {
-			log.Printf("[CAPTIVE] Network beyond %s (%s) does not answer probes — no portal confirmed", gw, iface)
+			log.Printf("[CAPTIVE] Сеть за %s (%s) не отвечает на пробы — портал не подтверждён", gw, iface)
 		}
 	}
 }
@@ -374,7 +378,7 @@ func (cw *captiveWatcher) runProbes(gw, iface string) (captiveVerdict, string) {
 	for _, tgt := range captiveProbeTargets {
 		ips := cw.resolveAllowed(tgt.host, dnsServers)
 		if len(ips) == 0 {
-			continue // the network's DNS does not answer — try the next target
+			continue // DNS сети не отвечает — попробовать следующий таргет
 		}
 		status, body, location := captiveHTTPGet(tgt.url)
 		if status == 0 {
