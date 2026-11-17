@@ -160,6 +160,10 @@ func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, exclud
 		cfg.mtu = 1280
 	}
 
+	// Правила NRPT captive-режима от прошлого запуска (падение процесса) —
+	// снимаем, чтобы в системе не остались правила, указывающие в чужую сеть.
+	_ = nrptRemoveAllTagged()
+
 	if err := ensureWintunDLL(); err != nil {
 		return err
 	}
@@ -294,6 +298,8 @@ func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, exclud
 		// Останавливаем route guard, чтобы он не переставлял маршруты
 		// параллельно с их удалением.
 		stopRouteGuard()
+		// Снимаем allow-правила captive-режима (NRPT и /32) вместе с туннелем.
+		stopCaptiveWatch()
 		// Сначала останавливаем DNS-прокси и возвращаем оригинальный DNS,
 		// чтобы приложения не потеряли резолв после удаления туннеля.
 		dnsProxyMu.Lock()
@@ -392,6 +398,8 @@ func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, exclud
 
 	// Мониторим смену физического шлюза/интерфейса и переставляем исключения.
 	startRouteGuard(rt)
+	// Watcher captive-порталов: первая проба сети — на ближайшем тике guard'а.
+	startCaptiveWatch()
 
 	return nil
 }

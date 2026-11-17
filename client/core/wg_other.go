@@ -24,3 +24,13 @@ func runRouteDelete(cidr string) {}
 
 // applyTurnHostRoute — no-op на не-Windows платформах.
 func applyTurnHostRoute(ip net.IP) {}
+
+// NRPT-заглушки и сброс DNS-кэша для не-Windows: captive-режим использует их
+// только из общего кода, на других платформах правила NRPT не существуют.
+func nrptAddRule(namespace string, servers []string) error {
+	return nil
+}
+
+func nrptRemoveAllTagged() error { return nil }
+
+func flushSystemDNSCacheOS() {}

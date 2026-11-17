@@ -147,6 +147,11 @@ func (rt *wgRuntime) loop() {
 
 		gw, iface := detectPhysicalGateway(rt.ifaceName)
 
+		// Captive watcher: проверка сети и переустановка allow-правил по расписанию
+		// (первая проба — сразу после старта guard'а, дальше — по смене сети и
+		// каждые captiveProbeEvery в captive-режиме).
+		captiveTick(gw, iface)
+
 		rt.mu.Lock()
 		curGw, curIface := rt.gateway, rt.iface
 		rt.mu.Unlock()
@@ -238,6 +243,10 @@ func (rt *wgRuntime) switchGateway(gw, iface string) {
 		overrideInterfaceDNS(iface)
 		_ = hiddenCmd("ipconfig", "/flushdns").Run()
 	}
+
+	// На новой сети прежние allow-правила (NRPT и /32) указывают в старый шлюз
+	// и старый DNS — снимаем их и перепроверяем сеть заново.
+	captiveNetworkChanged()
 
 	dnsProxyMu.Lock()
 	de := activeDomainExcluder
