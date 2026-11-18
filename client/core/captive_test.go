@@ -284,7 +284,16 @@ func TestAggregateCaptiveResults(t *testing.T) {
 		{"redirect on control host", []captiveProbeResult{ncsi, hijack}, captivePortal, "auth.example.net", true},
 		{"later URL beats earlier URL-less hijack", []captiveProbeResult{hijackNoURL, redirect}, captivePortal, "portal.example.com", true},
 		{"control ok alone is open", []captiveProbeResult{confirmOK}, captiveOpen, "", false},
-		{"all silent", []captiveProbeResult{confirmBlocked, captiveProbeResult{verdict: captiveUnknown}}, captiveUnknown, "", false},
+		{"any-of confirm: first silent, second ok", []captiveProbeResult{
+			{confirm: true, verdict: captiveUnknown},
+			confirmOK,
+			ncsi,
+		}, captiveOpen, "", false},
+		{"both confirm hosts silent", []captiveProbeResult{ncsi,
+			{confirm: true, verdict: captiveUnknown},
+			{confirm: true, verdict: captiveUnknown},
+		}, captivePortal, "", false},
+		{"all silent", []captiveProbeResult{confirmBlocked, {verdict: captiveUnknown}}, captiveUnknown, "", false},
 		{"no results", nil, captiveUnknown, "", false},
 	}
 	for _, tc := range cases {
@@ -362,6 +371,24 @@ func TestCaptiveDNSUpstreamIncompleteSnapshot(t *testing.T) {
 	active, _, _ = cw.captiveDNSUpstream()
 	if active {
 		t.Fatal("empty sourceIP snapshot must not activate captive upstream")
+	}
+}
+
+func TestCaptiveShouldAutoLaunch(t *testing.T) {
+	if captiveShouldAutoLaunch(captivePortalRedirect, "https://portal.example.com/x?ap=1") != true {
+		t.Fatal("redirect with URL must launch")
+	}
+	if captiveShouldAutoLaunch(captivePortalSilent, "") != true {
+		t.Fatal("silent fallback must launch (interception page catch)")
+	}
+	if captiveShouldAutoLaunch(captivePortalWhitelist, "") != false {
+		t.Fatal("whitelist without URL must not launch (fallback leads to open internet)")
+	}
+	if captiveShouldAutoLaunch(captivePortalWhitelist, "  ") != false {
+		t.Fatal("whitespace-only URL counts as absent")
+	}
+	if captiveShouldAutoLaunch(captivePortalWhitelist, "https://portal.example.com/") != true {
+		t.Fatal("whitelist with revealed URL must launch")
 	}
 }
 

@@ -8,7 +8,7 @@ package core
 // the browser does not resolve even the portal's own page.
 //
 // The process-scoped watcher breaks the circle without hardcoding specific portals:
-//   1. Plain-HTTP probes (NCSI, generate_204 and a non-whitelisted control host)
+//   1. Plain-HTTP probes (NCSI, generate_204 and non-whitelisted control hosts)
 //      go directly through the physical gateway. A redirect or a substituted body
 //      reveals the portal. Portal whitelists usually pass the standard NCSI/Android
 //      probe hosts while blocking everything else, so "open" additionally requires
@@ -65,10 +65,11 @@ const (
 //
 // Portal whitelists almost always pass the standard NCSI/Android probe hosts
 // (otherwise Windows and Android would keep showing their sign-in window), so
-// "NCSI answered" alone is not proof of a free network. The confirm target is
-// a host portals do not whitelist: open is accepted only when it answers as
-// expected too; if NCSI passes but confirm does not — the network is a
-// whitelisting portal.
+// "NCSI answered" alone is not proof of a free network. The confirm targets are
+// hosts portals do not whitelist: open is accepted only when AT LEAST ONE of
+// them answers as expected; if NCSI passes but all confirm hosts stay silent —
+// the network is a whitelisting portal. Any-of semantics: a single host does
+// not survive real networks (mobile operators filter whole domains).
 var captiveProbeTargets = []struct {
 	url     string
 	marker  string // "" — expecting HTTP 204 and an empty body
@@ -79,8 +80,13 @@ var captiveProbeTargets = []struct {
 	{url: "http://www.msftconnecttest.com/connecttest.txt", marker: "Microsoft Connect Test"},
 	// Backup: 204 with an empty body.
 	{url: "http://www.gstatic.com/generate_204", marker: ""},
-	// Control host: IANA-reserved domain, outside portal whitelists.
-	{url: "http://example.com/", marker: "Example Domain", confirm: true},
+	// Control hosts, none of which portals whitelist. Open requires at least
+	// ONE of them to answer: a single host does not survive real networks
+	// (mobile operators filter example.com entirely — field 18.11). Both are
+	// plain-HTTP only by design; info.cern.ch is CERN infrastructure,
+	// neverssl.com exists exactly for portal testing.
+	{url: "http://info.cern.ch/", marker: "info.cern.ch", confirm: true},
+	{url: "http://neverssl.com/", marker: "NeverSSL", confirm: true},
 }
 
 // Base probe names are derived from captiveProbeTargets. The entry host receives
@@ -108,9 +114,9 @@ type captiveProbeResult struct {
 //   - any intercepted target wins (portal); among intercepted targets the first
 //     one with a Location URL is preferred, so a later redirect is not lost to
 //     an earlier URL-less hijack;
-//   - open requires the confirm host to answer as expected: NCSI-only answers
-//     come from portal whitelists, not from a genuinely free network;
-//   - NCSI passed but confirm did not — a whitelisting portal;
+//   - open requires at least ONE confirm host to answer as expected: NCSI-only
+//     answers come from portal whitelists, not from a genuinely free network;
+//   - NCSI passed but every confirm host stayed silent — a whitelisting portal;
 //   - nothing answered definitively — unknown.
 func aggregateCaptiveResults(results []captiveProbeResult) (captiveVerdict, string, string) {
 	confirmOK, ncsiOK := false, false
@@ -953,7 +959,17 @@ func (cw *captiveWatcher) enterCaptive(gw, iface string, generation uint64, port
 				changed = true
 			}
 		}
-		if !cw.portalLaunchCurrent(gw, iface, generation) {
+		if !captiveShouldAutoLaunch(portalKind, entryURL) {
+			// Сырой вердикт зонда, не cw.portalKind: на первом whitelist-вердикте
+			// resolvePortalKind ещё понижает его до silent (порог двух подряд),
+			// и с resolved-значением пропуск был бы недостижим. Потери URL нет:
+			// whitelist-вердикт никогда не несёт Location.
+			// Whitelist-портал без адреса входа: NCSI видит «открытую» сеть,
+			// баннер Windows и перехват браузера (Chrome/Edge v101+) сами
+			// приведут пользователя на вход; открывать fallback нечего —
+			// на такой сети он ведёт просто в интернет (поле 18.11).
+			log.Printf("[CAPTIVE] Whitelist-портал без адреса входа — автооткрытие страницы пропущено")
+		} else if !cw.portalLaunchCurrent(gw, iface, generation) {
 			log.Printf("[CAPTIVE] Сеть сменилась во время подготовки портала — страница старой сети не открывается")
 		} else {
 			log.Printf("[CAPTIVE] Открываю страницу входа в браузере по умолчанию: %s", entry)
@@ -965,6 +981,14 @@ func (cw *captiveWatcher) enterCaptive(gw, iface string, generation uint64, port
 	if !wasActive || hostChanged || changed {
 		flushSystemDNSCache()
 	}
+}
+
+// captiveShouldAutoLaunch решает, стоит ли открывать страницу входа: для
+// whitelist-портала без раскрытого URL (fallback ведёт просто в интернет)
+// автооткрытие пропускается; во всех остальных случаях — открывается.
+func captiveShouldAutoLaunch(kind captivePortalKind, entryURL string) bool {
+	trimmed := strings.TrimSpace(entryURL)
+	return !(kind == captivePortalWhitelist && trimmed == "")
 }
 
 // portalLaunchCurrent rejects a delayed browser launch after a network epoch change.
