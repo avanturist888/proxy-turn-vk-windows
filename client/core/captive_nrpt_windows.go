@@ -37,13 +37,23 @@ func nrptAddRule(namespace string, servers []string) error {
 	return nil
 }
 
+// Remove-DnsClientNrptRule on this Windows build takes -Name with the rule's
+// GUID Name property (Get-DnsClientNrptRule returns it per rule), not
+// -Namespace — that parameter does not exist here (verified 18.11; the docs
+// describe the older build). Removal errors must surface: without
+// ErrorAction Stop a failed removal leaves stale rules that break NCSI and
+// system resolution on every network afterwards.
+const nrptRemoveScriptTail = `; if ($failed -gt 0) { exit 1 }`
+
 // nrptRemoveRule removes the tagged rule for one entry host before replacement.
 func nrptRemoveRule(namespace string) error {
 	if !validCaptiveHost(namespace) {
 		return fmt.Errorf("captive: NRPT namespace %q rejected", namespace)
 	}
-	ps := fmt.Sprintf(`Get-DnsClientNrptRule | Where-Object { $_.Comment -eq '%s' -and $_.Namespace -eq '%s' } | ForEach-Object { Remove-DnsClientNrptRule -Namespace $_.Namespace -Force } | Out-Null`,
-		captiveNRPTTag, namespace)
+	ps := fmt.Sprintf(`$failed = 0
+Get-DnsClientNrptRule | Where-Object { $_.Comment -eq '%s' -and @($_.Namespace) -contains '%s' } | ForEach-Object {
+  try { Remove-DnsClientNrptRule -Name $_.Name -Force -ErrorAction Stop } catch { $failed++; Write-Output $_.Exception.Message }
+} `+nrptRemoveScriptTail, captiveNRPTTag, namespace)
 	cmd := hiddenCmd("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("Remove-DnsClientNrptRule: %w; output=%s", err, strings.TrimSpace(string(out)))
@@ -54,8 +64,10 @@ func nrptRemoveRule(namespace string) error {
 // nrptRemoveAllTagged removes all NRPT rules with the captive-mode tag — ours
 // and any leftovers from a previous run.
 func nrptRemoveAllTagged() error {
-	ps := fmt.Sprintf(`Get-DnsClientNrptRule | Where-Object { $_.Comment -eq '%s' } | ForEach-Object { Remove-DnsClientNrptRule -Namespace $_.Namespace -Force } | Out-Null`,
-		captiveNRPTTag)
+	ps := fmt.Sprintf(`$failed = 0
+Get-DnsClientNrptRule | Where-Object { $_.Comment -eq '%s' } | ForEach-Object {
+  try { Remove-DnsClientNrptRule -Name $_.Name -Force -ErrorAction Stop } catch { $failed++; Write-Output $_.Exception.Message }
+} `+nrptRemoveScriptTail, captiveNRPTTag)
 	cmd := hiddenCmd("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("Remove-DnsClientNrptRule: %w; output=%s", err, strings.TrimSpace(string(out)))
