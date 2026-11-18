@@ -282,6 +282,7 @@ func (a *App) GetVkAuthStatus() map[string]interface{} {
 // Shutdown вызывается Wails при завершении приложения (OnShutdown).
 // Останавливает туннель (WireGuard, DNS-прокси, маршруты), если он был активен.
 func (a *App) Shutdown(ctx context.Context) {
+	core.StopCaptiveWatcher()
 	if a.orch != nil {
 		a.orch.Stop()
 	}

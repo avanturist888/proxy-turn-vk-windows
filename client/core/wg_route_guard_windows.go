@@ -147,11 +147,6 @@ func (rt *wgRuntime) loop() {
 
 		gw, iface := detectPhysicalGateway(rt.ifaceName)
 
-		// Captive watcher: проверка сети и переустановка allow-правил по расписанию
-		// (первая проба — сразу после старта guard'а, дальше — по смене сети и
-		// каждые captiveProbeEvery в captive-режиме).
-		captiveTick(gw, iface)
-
 		rt.mu.Lock()
 		curGw, curIface := rt.gateway, rt.iface
 		rt.mu.Unlock()
@@ -240,13 +235,17 @@ func (rt *wgRuntime) switchGateway(gw, iface string) {
 	}
 
 	if rt.dnsOverride {
-		overrideInterfaceDNS(iface)
-		_ = hiddenCmd("ipconfig", "/flushdns").Run()
+		// Новая сеть — принудительно перечитываем её DNS (DHCP, при пустом —
+		// шлюз): смена шлюза/интерфейса здесь уже состоялась, и активный
+		// override прежней сети не повод пропускать recapture. Резолв остаётся
+		// сетевым, пока проба или живой туннель не подтвердят новую сеть
+		// (applyDNSOverride).
+		recaptureInterfaceDNSForCaptive(iface, gw)
 	}
 
-	// На новой сети прежние allow-правила (NRPT и /32) указывают в старый шлюз
-	// и старый DNS — снимаем их и перепроверяем сеть заново.
-	captiveNetworkChanged()
+	// После перестановки маршрутов и перечитывания DNS invalidate'им любую
+	// пробу старой эпохи и разрешаем процессному вотчеру проверить новую сеть.
+	captiveNetworkChanged(gw, iface)
 
 	dnsProxyMu.Lock()
 	de := activeDomainExcluder
@@ -334,23 +333,48 @@ func applyTurnHostRoute(ip net.IP) {
 	}
 }
 
-// overrideInterfaceDNS подменяет DNS интерфейса на 127.0.0.1, запоминая
-// оригинал для восстановления в teardown. Повторный вызов для того же
-// интерфейса — no-op.
-func overrideInterfaceDNS(iface string) {
+// overrideInterfaceDNS подменяет DNS интерфейса на 127.0.0.1 и сообщает об
+// успехе. Флаг активности выставляется только после успешного netsh, чтобы
+// следующий тик мог повторить неудачную попытку.
+func overrideInterfaceDNS(iface string) bool {
 	if iface == "" {
-		return
+		return false
+	}
+	dnsConfigMu.Lock()
+	defer dnsConfigMu.Unlock()
+	dnsProxyMu.Lock()
+	_, captured := originalDNSByIf[iface]
+	dnsProxyMu.Unlock()
+	if !captured {
+		cfg, err := getInterfaceDNSConfig(iface)
+		if err != nil {
+			log.Printf("[DNS] Не удалось снять оригинальный DNS %s: %v", iface, err)
+			return false
+		}
+		// Loopback-only — след собственного устаревшего override (снимали
+		// процесс принудительно), пустой static восстановить нечем: как
+		// «оригинал» такой capture не годится. Подмену применяем, но откат
+		// возьмёт DHCP при следующем recapture.
+		badCapture := loopbackOnlyDNS(cfg) || (cfg.source == "static" && len(cfg.servers) == 0)
+		dnsProxyMu.Lock()
+		if _, done := originalDNSByIf[iface]; !done && !badCapture {
+			originalDNSByIf[iface] = cfg
+		}
+		dnsProxyMu.Unlock()
 	}
 	dnsProxyMu.Lock()
-	defer dnsProxyMu.Unlock()
-	if _, done := originalDNSByIf[iface]; done {
-		return
-	}
-	orig := getInterfaceDNS(iface)
-	originalDNSByIf[iface] = orig
+	orig := originalDNSByIf[iface]
+	dnsProxyMu.Unlock()
 	if err := setInterfaceDNS(iface, []string{"127.0.0.1"}); err != nil {
+		dnsProxyMu.Lock()
+		dnsOverrideActiveByIf[iface] = false
+		dnsProxyMu.Unlock()
 		log.Printf("[DNS] Не удалось подменить системный DNS на %s: %v", iface, err)
-		return
+		return false
 	}
-	log.Printf("[DNS] Системный DNS %s: %v → 127.0.0.1 (через локальный прокси)", iface, orig)
+	dnsProxyMu.Lock()
+	dnsOverrideActiveByIf[iface] = true
+	dnsProxyMu.Unlock()
+	log.Printf("[DNS] Системный DNS %s: %v → 127.0.0.1 (через локальный прокси)", iface, orig.servers)
+	return true
 }

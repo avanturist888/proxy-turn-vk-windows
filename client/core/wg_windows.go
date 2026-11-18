@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -31,10 +32,10 @@ import (
 
 var (
 	// wintunAPI provides direct access to wintun.dll for adapter lifecycle management.
-	wintunMod          = syscall.NewLazyDLL("wintun.dll")
-	procWintunOpen     = wintunMod.NewProc("WintunOpenAdapter")
-	procWintunClose    = wintunMod.NewProc("WintunCloseAdapter")
-	procWintunDelete   = wintunMod.NewProc("WintunDeleteAdapter")
+	wintunMod        = syscall.NewLazyDLL("wintun.dll")
+	procWintunOpen   = wintunMod.NewProc("WintunOpenAdapter")
+	procWintunClose  = wintunMod.NewProc("WintunCloseAdapter")
+	procWintunDelete = wintunMod.NewProc("WintunDeleteAdapter")
 )
 
 // setFixedTUNGUID устанавливает фиксированный GUID для wintun-адаптера на основе
@@ -143,11 +144,18 @@ var (
 // 127.0.0.1:53 и оригинальным DNS пользователя, который мы временно
 // подменяем на 127.0.0.1, чтобы все приложения ходили через наш прокси
 // (а не через локальный DNS провайдера, который может перехватывать/резать).
+type interfaceDNSConfig struct {
+	servers []string
+	source  string // "dhcp" or "static"
+}
+
 var (
-	dnsProxyMu          sync.Mutex
-	globalDNSProxy      *dnsProxy
-	originalDNSByIf     = make(map[string][]string)
-	activeDomainExcluder *domainExcluder // гибридный excluder для доменных исключений
+	dnsConfigMu           sync.Mutex // serializes netsh DNS changes and their activity flags
+	dnsProxyMu            sync.Mutex
+	globalDNSProxy        *dnsProxy
+	originalDNSByIf       = make(map[string]interfaceDNSConfig)
+	dnsOverrideActiveByIf = make(map[string]bool) // iface → DNS сейчас подменён на 127.0.0.1
+	activeDomainExcluder  *domainExcluder         // гибридный excluder для доменных исключений
 )
 
 func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, excludeDomains []string) error {
@@ -159,10 +167,6 @@ func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, exclud
 	if cfg.mtu <= 0 {
 		cfg.mtu = 1280
 	}
-
-	// Правила NRPT captive-режима от прошлого запуска (падение процесса) —
-	// снимаем, чтобы в системе не остались правила, указывающие в чужую сеть.
-	_ = nrptRemoveAllTagged()
 
 	if err := ensureWintunDLL(); err != nil {
 		return err
@@ -298,8 +302,7 @@ func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, exclud
 		// Останавливаем route guard, чтобы он не переставлял маршруты
 		// параллельно с их удалением.
 		stopRouteGuard()
-		// Снимаем allow-правила captive-режима (NRPT и /32) вместе с туннелем.
-		stopCaptiveWatch()
+		// Состояние captive-вотчера и его allow-правила переживают WG-teardown.
 		// Сначала останавливаем DNS-прокси и возвращаем оригинальный DNS,
 		// чтобы приложения не потеряли резолв после удаления туннеля.
 		dnsProxyMu.Lock()
@@ -307,13 +310,21 @@ func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, exclud
 			globalDNSProxy.Stop()
 			globalDNSProxy = nil
 		}
+		dnsProxyMu.Unlock()
+		// Восстановление DNS и снятие флага — под dnsConfigMu, чтобы
+		// запоздавший applyDNSOverride вотчера не втиснул 127.0.0.1 после
+		// восстановления (порядок блокировок: dnsConfigMu → dnsProxyMu).
+		dnsConfigMu.Lock()
+		dnsProxyMu.Lock()
 		for iface, orig := range originalDNSByIf {
 			if err := restoreInterfaceDNS(iface, orig); err != nil {
 				log.Printf("[DNS] Не удалось восстановить DNS на %s: %v", iface, err)
 			}
 			delete(originalDNSByIf, iface)
+			delete(dnsOverrideActiveByIf, iface)
 		}
 		dnsProxyMu.Unlock()
+		dnsConfigMu.Unlock()
 		_ = hiddenCmd("ipconfig", "/flushdns").Run()
 
 		// Останавливаем domain excluder (удаляет все /32 маршруты).
@@ -385,8 +396,12 @@ func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, exclud
 				log.Printf("[DOMEXCL] Доменные исключения не активированы (gateway=%q, dns=%v)", origGateway, customDNS)
 			}
 
-			overrideInterfaceDNS(origIface)
-			// Сбрасываем кэш, чтобы новые запросы пошли сразу через прокси.
+			// Первичная сеть: снимаем её DNS (DHCP, при пустом — шлюз) как
+			// «оригинал» для открата. Подмена на 127.0.0.1 произойдёт после
+			// успешной пробы (applyDNSOverride) — на портальной сети резолв
+			// остаётся сетевым, чтобы страница входа открывалась.
+			recaptureInterfaceDNS(origIface, origGateway)
+			// Сбрасываем кэш, чтобы новые запросы пошли через актуальный резолв.
 			_ = hiddenCmd("ipconfig", "/flushdns").Run()
 		}
 	}
@@ -398,8 +413,6 @@ func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, exclud
 
 	// Мониторим смену физического шлюза/интерфейса и переставляем исключения.
 	startRouteGuard(rt)
-	// Watcher captive-порталов: первая проба сети — на ближайшем тике guard'а.
-	startCaptiveWatch()
 
 	return nil
 }
@@ -501,26 +514,60 @@ func setWindowsInterfaceDNS(iface, dns string) error {
 	return runNetsh("interface", "ipv4", "set", "dnsservers", fmt.Sprintf("name=%s", iface), "source=static", fmt.Sprintf("address=%s", dns), "register=primary", "validate=no")
 }
 
-// getInterfaceDNS читает текущий список DNS-серверов интерфейса через netsh.
-// Возвращает nil, если DNS назначен через DHCP (пусто) или не удалось распарсить.
-func getInterfaceDNS(iface string) []string {
-	out, err := hiddenCmd("netsh", "interface", "ipv4", "show", "dnsservers", fmt.Sprintf("name=%s", iface)).Output()
+// getInterfaceDNSConfig reads every IPv4 DNS server without line-based netsh
+// parsing (the first DHCP address shares a line with a localized label). The
+// per-interface registry value distinguishes explicit static DNS from DHCP;
+// DhcpNameServer may remain populated even when static DNS takes precedence.
+func getInterfaceDNSConfig(iface string) (interfaceDNSConfig, error) {
+	const ps = `
+$alias = $env:WDTT_DNS_IFACE
+$servers = @(Get-DnsClientServerAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction Stop |
+  ForEach-Object { $_.ServerAddresses } | Where-Object { $_ } | Select-Object -Unique)
+$guid = (Get-NetAdapter -InterfaceAlias $alias -ErrorAction Stop).InterfaceGuid
+$reg = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$guid" -ErrorAction SilentlyContinue
+$source = 'dhcp'
+if ($null -ne $reg -and -not [string]::IsNullOrWhiteSpace([string]$reg.NameServer)) { $source = 'static' }
+[pscustomobject]@{ source = $source; servers = @($servers) } | ConvertTo-Json -Compress`
+	cmd := hiddenCmd("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+	cmd.Env = append(os.Environ(), "WDTT_DNS_IFACE="+iface)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
+		return interfaceDNSConfig{}, fmt.Errorf("Get-DnsClientServerAddress %s: %w; output=%s", iface, err, strings.TrimSpace(string(out)))
+	}
+	return parseInterfaceDNSConfig(out)
+}
+
+func parseInterfaceDNSConfig(out []byte) (interfaceDNSConfig, error) {
+	var raw struct {
+		Source  string   `json:"source"`
+		Servers []string `json:"servers"`
+	}
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return interfaceDNSConfig{}, fmt.Errorf("parse DNS configuration: %w", err)
+	}
+	if raw.Source != "dhcp" && raw.Source != "static" {
+		return interfaceDNSConfig{}, fmt.Errorf("unknown DNS source %q", raw.Source)
+	}
+	servers := make([]string, 0, len(raw.Servers))
+	for _, server := range raw.Servers {
+		server = strings.TrimSpace(server)
+		ip := net.ParseIP(server)
+		if ip == nil || ip.To4() == nil {
+			return interfaceDNSConfig{}, fmt.Errorf("invalid IPv4 DNS server %q", server)
+		}
+		servers = append(servers, ip.To4().String())
+	}
+	return interfaceDNSConfig{servers: servers, source: raw.Source}, nil
+}
+
+// getInterfaceDNS is kept for callers that need only the effective server list.
+func getInterfaceDNS(iface string) []string {
+	cfg, err := getInterfaceDNSConfig(iface)
+	if err != nil {
+		log.Printf("[DNS] Не удалось прочитать DNS %s: %v", iface, err)
 		return nil
 	}
-	var servers []string
-	for _, line := range strings.Split(string(out), "\n") {
-		s := strings.TrimSpace(line)
-		// Строки вида "8.8.8.8" или "10.0.0.1" в выводе netsh. Пропускаем заголовки/пустые.
-		if s == "" || strings.Contains(s, " ") {
-			continue
-		}
-		if net.ParseIP(s) == nil {
-			continue
-		}
-		servers = append(servers, s)
-	}
-	return servers
+	return cfg.servers
 }
 
 // setInterfaceDNS ставит список DNS-серверов на интерфейс. Первый сервер
@@ -543,13 +590,131 @@ func setInterfaceDNS(iface string, servers []string) error {
 	return nil
 }
 
-// restoreInterfaceDNS восстанавливает оригинальные DNS-серверы интерфейса.
-// Если orig пуст — переключает на DHCP.
-func restoreInterfaceDNS(iface string, orig []string) error {
-	if len(orig) == 0 {
+// restoreInterfaceDNS restores both the server list and its original source.
+// In particular, an originally DHCP configuration always goes back to DHCP,
+// even when a temporary gateway fallback was used during captive mode.
+func restoreInterfaceDNS(iface string, orig interfaceDNSConfig) error {
+	if orig.source == "dhcp" {
 		return runNetsh("interface", "ipv4", "set", "dnsservers", fmt.Sprintf("name=%s", iface), "source=dhcp", "validate=no")
 	}
-	return setInterfaceDNS(iface, orig)
+	if orig.source != "static" {
+		return fmt.Errorf("unknown original DNS source %q", orig.source)
+	}
+	if len(orig.servers) == 0 {
+		return fmt.Errorf("original static DNS list is empty")
+	}
+	return setInterfaceDNS(iface, orig.servers)
+}
+
+// loopbackOnlyDNS identifies our own static 127.0.0.1 override. It must never
+// be saved as the rollback configuration, including after a failed DHCP reset.
+func loopbackOnlyDNS(cfg interfaceDNSConfig) bool {
+	if len(cfg.servers) != 1 {
+		return false
+	}
+	ip := net.ParseIP(cfg.servers[0])
+	return ip != nil && ip.IsLoopback()
+}
+
+// recaptureInterfaceDNS refreshes the original network DNS without replacing a
+// non-empty DHCP answer with the gateway. Static user DNS is restored as static;
+// DHCP is re-read as DHCP. Only a genuinely empty DHCP answer gets a temporary
+// gateway resolver, while the saved rollback configuration remains source=dhcp.
+// Route-guard recapture yields to an already active captive DNS override.
+func recaptureInterfaceDNS(iface, gateway string) {
+	recaptureInterfaceDNSMode(iface, gateway, false)
+}
+
+// recaptureInterfaceDNSForCaptive deliberately withdraws the override after the
+// formerly open tunnel stayed dead for several ticks and probing resumed.
+func recaptureInterfaceDNSForCaptive(iface, gateway string) {
+	recaptureInterfaceDNSMode(iface, gateway, true)
+}
+
+func recaptureInterfaceDNSMode(iface, gateway string, force bool) {
+	if iface == "" {
+		return
+	}
+	dnsConfigMu.Lock()
+	defer dnsConfigMu.Unlock()
+	if !force && dnsOverrideActive(iface) {
+		log.Printf("[DNS] Recapture %s пропущен: captive override активен", iface)
+		return
+	}
+
+	dnsProxyMu.Lock()
+	previous, hadPrevious := originalDNSByIf[iface]
+	dnsOverrideActiveByIf[iface] = false
+	dnsProxyMu.Unlock()
+
+	cfg := previous
+	if hadPrevious && previous.source == "static" {
+		if err := restoreInterfaceDNS(iface, previous); err != nil {
+			log.Printf("[DNS] Не удалось вернуть статический DNS на %s: %v", iface, err)
+		}
+	} else if hadPrevious && previous.source == "dhcp" {
+		dhcpErr := runNetsh("interface", "ipv4", "set", "dnsservers", fmt.Sprintf("name=%s", iface), "source=dhcp", "validate=no")
+		time.Sleep(time.Second) // стек применяет lease не мгновенно
+		if current, err := getInterfaceDNSConfig(iface); err == nil {
+			if loopbackOnlyDNS(current) {
+				log.Printf("[DNS] DHCP reset %s не дал сетевой DNS; loopback override не сохраняем как оригинал", iface)
+			} else {
+				cfg = current
+				if dhcpErr == nil {
+					cfg.source = "dhcp"
+				}
+			}
+		} else {
+			log.Printf("[DNS] Не удалось перечитать DHCP DNS %s: %v", iface, err)
+		}
+		if dhcpErr != nil {
+			log.Printf("[DNS] Не удалось вернуть DHCP DNS на %s: %v", iface, dhcpErr)
+		}
+	} else {
+		current, err := getInterfaceDNSConfig(iface)
+		if err != nil {
+			log.Printf("[DNS] Не удалось снять конфигурацию DNS %s: %v", iface, err)
+			return
+		}
+		if loopbackOnlyDNS(current) {
+			// A previous process may have exited after the override but before
+			// saving its capture. Restore DHCP and never roll back to that loopback.
+			log.Printf("[DNS] На %s найден устаревший loopback override — перечитываю DHCP", iface)
+			if err := runNetsh("interface", "ipv4", "set", "dnsservers", fmt.Sprintf("name=%s", iface), "source=dhcp", "validate=no"); err != nil {
+				log.Printf("[DNS] Не удалось сбросить устаревший override на %s: %v", iface, err)
+				return
+			}
+			time.Sleep(time.Second)
+			current, err = getInterfaceDNSConfig(iface)
+			if err != nil {
+				log.Printf("[DNS] Не удалось перечитать DHCP DNS %s: %v", iface, err)
+				return
+			}
+			if loopbackOnlyDNS(current) {
+				log.Printf("[DNS] %s всё ещё сообщает только loopback DNS — capture отклонён", iface)
+				return
+			}
+			current.source = "dhcp"
+		}
+		cfg = current
+	}
+
+	if loopbackOnlyDNS(cfg) {
+		log.Printf("[DNS] Отклонён loopback-only capture на %s", iface)
+		return
+	}
+	if cfg.source == "dhcp" && len(cfg.servers) == 0 && gateway != "" {
+		if err := setInterfaceDNS(iface, []string{gateway}); err == nil {
+			log.Printf("[DNS] Сеть не выдала DNS по DHCP — шлюз %s временно работает resolver'ом", gateway)
+		} else {
+			log.Printf("[DNS] Не удалось задать временный resolver %s на %s: %v", gateway, iface, err)
+		}
+	}
+	dnsProxyMu.Lock()
+	originalDNSByIf[iface] = cfg
+	dnsOverrideActiveByIf[iface] = false
+	dnsProxyMu.Unlock()
+	log.Printf("[DNS] DNS сети %s: %v (source=%s, оригинал для отката)", iface, cfg.servers, cfg.source)
 }
 
 func setWindowsInterfaceMetric(iface string, metric int) error {
@@ -696,6 +861,7 @@ func runNetsh(args ...string) error {
 //   - не требует повышения прав при наличии admin manifest
 //   - работает одинаково и на старых, и на новых Windows
 //   - не падает на длинных route-таблицах
+//
 // Возвращает true если маршрут успешно добавлен.
 func runRouteAdd(cidr, gateway string) bool {
 	cmd := hiddenCmd("route", "add", cidr, gateway, "metric", "1")
@@ -804,4 +970,3 @@ func copyFile(src, dst string) error {
 	}
 	return nil
 }
-

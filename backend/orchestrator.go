@@ -975,6 +975,9 @@ func (o *Orchestrator) handlePipelineEvent(ev core.Event) {
 // потому что o.sess обнуляется только в forwardEvents после WG-teardown,
 // а это занимает 5-15 секунд.
 func (o *Orchestrator) Stop() {
+	// Явное «Отключить» завершает и captive-вотчер; автоматический reconnect
+	// идёт через stopSession(…, false) и сохраняет его состояние и правила.
+	core.StopCaptiveWatcher()
 	// Пользователь нажал «Отключить»: отменяем ожидающее переподключение.
 	if o.cancelReconnect() {
 		runtime.EventsEmit(o.appCtx, "log", "INFO", "[RECONNECT] Автопереподключение отменено")

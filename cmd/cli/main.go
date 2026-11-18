@@ -158,6 +158,9 @@ func main() {
 		for {
 			time.Sleep(2 * time.Second)
 			if os.Getppid() != ppid {
+				// Снять NRPT//32-правила captive-режима до выхода: их
+				// переживёт только штатная остановка.
+				core.StopCaptiveWatcher()
 				os.Exit(0)
 			}
 		}
@@ -193,6 +196,7 @@ func main() {
 	}
 
 	log.Println("[CLI] Core завершил работу")
+	core.StopCaptiveWatcher()
 	_ = atomic.LoadInt32 // keep atomic imported
 }
 
@@ -217,4 +221,3 @@ func parseCustomDNS(s string) []string {
 	}
 	return out
 }
-

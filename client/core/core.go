@@ -13,24 +13,24 @@ import (
 
 // Config — все параметры запуска (соответствует старым флагам main()).
 type Config struct {
-	PeerAddr     string   // -peer
-	Password     string   // -password (WRAP key derives from this)
-	Hashes       []string // -vk (уже распарсенные ParseHashes)
-	Listen       string   // -listen, default "127.0.0.1:9000"
-	TurnHost     string   // -turn
-	TurnPort     string   // -port
-	DeviceID     string   // -device-id
-	Workers      int      // -n
-	CaptchaMode  string   // -captcha-mode: auto/wv/rjs
-	VkAuthMode   string   // -vk-auth: anonymous/account
-	Fingerprint  string   // -fingerprint: chrome/safari/...
-	ClientIDs    string   // -client-ids
-	WGInterface  string   // -wg-interface, default "WDTT"
-	AutoWG       bool     // -windows-wg
-	DNSUpstream  []string // -dns (если пусто — дефолт 8.8.8.8,1.1.1.1)
-	NoDNSProxy   bool     // -no-dns-proxy
-	WGConfigMTU  int      // MTU для патча конфига (0 = default 1280)
-	ObfsMode     string   // "audio" (default) or "video" RTP masking
+	PeerAddr    string   // -peer
+	Password    string   // -password (WRAP key derives from this)
+	Hashes      []string // -vk (уже распарсенные ParseHashes)
+	Listen      string   // -listen, default "127.0.0.1:9000"
+	TurnHost    string   // -turn
+	TurnPort    string   // -port
+	DeviceID    string   // -device-id
+	Workers     int      // -n
+	CaptchaMode string   // -captcha-mode: auto/wv/rjs
+	VkAuthMode  string   // -vk-auth: anonymous/account
+	Fingerprint string   // -fingerprint: chrome/safari/...
+	ClientIDs   string   // -client-ids
+	WGInterface string   // -wg-interface, default "WDTT"
+	AutoWG      bool     // -windows-wg
+	DNSUpstream []string // -dns (если пусто — дефолт 8.8.8.8,1.1.1.1)
+	NoDNSProxy  bool     // -no-dns-proxy
+	WGConfigMTU int      // MTU для патча конфига (0 = default 1280)
+	ObfsMode    string   // "audio" (default) or "video" RTP masking
 
 	// ExcludeDomains — список паттернов доменов для исключения из туннеля.
 	// Поддерживает wildcards (*.example.com). Гибридный режим: DNS-прокси
@@ -61,8 +61,8 @@ type Event struct {
 // Core — runtime controller ядра. Потокобезопасен, можно Start/Stop несколько раз
 // (повторный Start после Stop создаёт новое ядро — нужна пересоздать через New).
 type Core struct {
-	cfg  Config
-	ctx  context.Context
+	cfg    Config
+	ctx    context.Context
 	cancel context.CancelFunc
 
 	pauseFlag int32
@@ -74,10 +74,10 @@ type Core struct {
 
 	// Кэш последнего WG-конфига: если тот же профиль перезапускается
 	// в течение wgConfigCacheTTL, конфиг берётся из памяти, минуя DTLS exchange.
-	wgCacheMu       sync.Mutex
-	wgCacheConf     string
-	wgCacheAt       time.Time
-	wgCacheKey      string
+	wgCacheMu   sync.Mutex
+	wgCacheConf string
+	wgCacheAt   time.Time
+	wgCacheKey  string
 
 	// eventsMu защищает закрытие c.events: emit() после close() = паника
 	// "send on closed channel". Раньше это могло случиться, когда ядро
@@ -300,6 +300,13 @@ func (c *Core) Start(ctx context.Context) (<-chan Event, error) {
 
 	stats := NewStats()
 	c.stats = stats
+	if c.cfg.AutoWG {
+		// Вотчер живёт на уровне приложения, а не этой WG-сессии:
+		// он продолжает работать до получения конфига и между reconnect'ами.
+		startCaptiveWatch(c.cfg.WGInterface, func() bool {
+			return atomic.LoadInt32(&stats.ActiveConnections) > 0
+		})
+	}
 
 	shutdownCh := make(chan struct{})
 	go func() {
@@ -318,11 +325,11 @@ func (c *Core) Start(ctx context.Context) (<-chan Event, error) {
 		customDNS = []string{"8.8.8.8", "1.1.1.1"}
 	}
 
-		go func() {
-			defer close(configDone)
-			defer TeardownWindowsWireGuard()
-			applyConfig := func(rawConf string, fromCache bool) {
-				finalConf := patchWGConfig(rawConf, c.cfg.WGConfigMTU)
+	go func() {
+		defer close(configDone)
+		defer TeardownWindowsWireGuard()
+		applyConfig := func(rawConf string, fromCache bool) {
+			finalConf := patchWGConfig(rawConf, c.cfg.WGConfigMTU)
 			log.Println("╔══════════════ WireGuard Конфиг ══════════════╗")
 			for _, line := range strings.Split(finalConf, "\n") {
 				log.Printf("║ %-44s ║", line)
@@ -541,6 +548,3 @@ func (c *Core) emit(ev Event) {
 		}
 	}
 }
-
-
-

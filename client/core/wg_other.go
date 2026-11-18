@@ -21,9 +21,13 @@ func runRouteAdd(cidr, gateway string) bool {
 
 func runRouteDelete(cidr string) {}
 
-
 // applyTurnHostRoute — no-op на не-Windows платформах.
 func applyTurnHostRoute(ip net.IP) {}
+
+// detectPhysicalGateway — заглушка для общего captive-вотчера.
+func detectPhysicalGateway(excludeIface string) (gateway, ifaceName string) {
+	return "", ""
+}
 
 // NRPT-заглушки и сброс DNS-кэша для не-Windows: captive-режим использует их
 // только из общего кода, на других платформах правила NRPT не существуют.
@@ -33,4 +37,9 @@ func nrptAddRule(namespace string, servers []string) error {
 
 func nrptRemoveAllTagged() error { return nil }
 
+func nrptRemoveRule(namespace string) error { return nil }
+
 func flushSystemDNSCacheOS() {}
+
+// launchEdgeOS — заглушка на не-Windows: Edge открывается только там.
+func launchEdgeOS(entryURL string) error { return nil }
