@@ -8,8 +8,11 @@ package core
 // the browser does not resolve even the portal's own page.
 //
 // The process-scoped watcher breaks the circle without hardcoding specific portals:
-//   1. Plain-HTTP probes (NCSI and generate_204) go directly through the physical
-//      gateway. A redirect or a substituted body reveals the portal.
+//   1. Plain-HTTP probes (NCSI, generate_204 and a non-whitelisted control host)
+//      go directly through the physical gateway. A redirect or a substituted body
+//      reveals the portal. Portal whitelists usually pass the standard NCSI/Android
+//      probe hosts while blocking everything else, so "open" additionally requires
+//      the control host to answer; NCSI-only answers mean a whitelisting portal.
 //   2. The interface DNS remains the network DNS until the network is usable. Only
 //      the entry host gets an exact NRPT rule, and only to a resolver that actually
 //      returned A records. This is required even when the resolver is also present
@@ -57,15 +60,25 @@ const (
 // captiveProbeTarget — a check "is there internet beyond the gateway".
 // Only plain HTTP: interception shows itself as a redirect or a substitution page;
 // over HTTPS it would look like a certificate error and would not reveal the portal.
+//
+// Portal whitelists almost always pass the standard NCSI/Android probe hosts
+// (otherwise Windows and Android would keep showing their sign-in window), so
+// "NCSI answered" alone is not proof of a free network. The confirm target is
+// a host portals do not whitelist: open is accepted only when it answers as
+// expected too; if NCSI passes but confirm does not — the network is a
+// whitelisting portal.
 var captiveProbeTargets = []struct {
-	url    string
-	marker string // "" — expecting HTTP 204 and an empty body
-	host   string // filled in init
+	url     string
+	marker  string // "" — expecting HTTP 204 and an empty body
+	confirm bool   // control host: open requires its expected answer
+	host    string // filled in init
 }{
 	// The same probe as Windows NCSI: on a free network — 200 with this body.
 	{url: "http://www.msftconnecttest.com/connecttest.txt", marker: "Microsoft Connect Test"},
 	// Backup: 204 with an empty body.
 	{url: "http://www.gstatic.com/generate_204", marker: ""},
+	// Control host: IANA-reserved domain, outside portal whitelists.
+	{url: "http://example.com/", marker: "Example Domain", confirm: true},
 }
 
 // Base probe names are derived from captiveProbeTargets. The entry host receives
@@ -79,6 +92,61 @@ func init() {
 		}
 		captiveProbeTargets[i].host = strings.ToLower(u.Hostname())
 	}
+}
+
+// captiveProbeResult is one probe target's outcome for aggregation.
+type captiveProbeResult struct {
+	confirm  bool
+	verdict  captiveVerdict
+	host     string
+	location string
+}
+
+// aggregateCaptiveResults combines per-target outcomes:
+//   - any intercepted target wins (portal); among intercepted targets the first
+//     one with a Location URL is preferred, so a later redirect is not lost to
+//     an earlier URL-less hijack;
+//   - open requires the confirm host to answer as expected: NCSI-only answers
+//     come from portal whitelists, not from a genuinely free network;
+//   - NCSI passed but confirm did not — a whitelisting portal;
+//   - nothing answered definitively — unknown.
+func aggregateCaptiveResults(results []captiveProbeResult) (captiveVerdict, string, string) {
+	confirmOK, ncsiOK := false, false
+	withURL, anyPortal := -1, -1
+	for i, r := range results {
+		if r.verdict == captivePortal {
+			if anyPortal < 0 {
+				anyPortal = i
+			}
+			if withURL < 0 && r.location != "" {
+				withURL = i
+			}
+			continue
+		}
+		if r.verdict != captiveOpen {
+			continue
+		}
+		if r.confirm {
+			confirmOK = true
+		} else {
+			ncsiOK = true
+		}
+	}
+	if withURL >= 0 {
+		r := results[withURL]
+		return captivePortal, r.host, r.location
+	}
+	if anyPortal >= 0 {
+		r := results[anyPortal]
+		return captivePortal, r.host, r.location
+	}
+	if confirmOK {
+		return captiveOpen, "", ""
+	}
+	if ncsiOK {
+		return captivePortal, "", ""
+	}
+	return captiveUnknown, "", ""
 }
 
 // ─── Response classification (pure logic, covered by tests) ─────────────────
@@ -574,10 +642,12 @@ func (cw *captiveWatcher) finishOpen(gw, iface string, generation uint64, fromPr
 	cw.applyDNSOverride(gw, iface, generation, reason)
 }
 
-// runProbes проходит таргеты зонда до первого определённого ответа.
-// Добавляет /32 маршруты к DNS-серверам и хостам зонда через шлюз. На open и
-// unknown удаляет только маршруты, добавленные этой попыткой; правила прежнего
-// активного портала сохраняются до вердикта open или живого туннеля.
+// runProbes проходит все таргеты зонда и агрегирует вердикты (см.
+// aggregateCaptiveResults: open требует и контрольного хоста, не входящего
+// в белые списки порталов). Добавляет /32 маршруты к DNS-серверам и хостам
+// зонда через шлюз. На open и unknown удаляет только маршруты, добавленные
+// этой попыткой; правила прежнего активного портала сохраняются до вердикта
+// open или живого туннеля.
 func (cw *captiveWatcher) runProbes(gw, iface string, generation uint64) (captiveVerdict, string, string) {
 	baseline := cw.routeSnapshot()
 	dnsServers := captiveDNSServers(iface, gw)
@@ -591,28 +661,48 @@ func (cw *captiveWatcher) runProbes(gw, iface string, generation uint64) (captiv
 		cw.addAllowRoute(srv, gw, generation)
 	}
 
+	var results []captiveProbeResult
+	var summary []string
 	for _, tgt := range captiveProbeTargets {
 		ips := cw.resolveAllowed(tgt.host, dnsServers, gw, generation)
 		if len(ips) == 0 {
+			summary = append(summary, tgt.host+"=нет DNS")
 			continue
 		}
 		// The HTTP request must use the address obtained by the direct DNS query:
 		// system resolution may be controlled by unrelated NRPT rules.
 		status, body, location := captiveHTTPGet(tgt.url, ips)
 		if status == 0 {
+			summary = append(summary, tgt.host+"=тишина")
 			continue
 		}
 		v, host := classifyCaptiveProbe(status, body, location, tgt.marker)
-		if v == captiveOpen {
-			cw.removeProbeRoutes(baseline)
-			return v, host, ""
-		}
-		if v == captivePortal {
-			return v, host, location
-		}
+		summary = append(summary, fmt.Sprintf("%s=%s", tgt.host, captiveVerdictName(v)))
+		results = append(results, captiveProbeResult{
+			confirm:  tgt.confirm,
+			verdict:  v,
+			host:     host,
+			location: location,
+		})
 	}
-	cw.removeProbeRoutes(baseline)
-	return captiveUnknown, "", ""
+	verdict, portalHost, portalURL := aggregateCaptiveResults(results)
+	log.Printf("[CAPTIVE] Проба сети (%s via %s): %s → %s", iface, gw, strings.Join(summary, " "), captiveVerdictName(verdict))
+	if verdict != captivePortal {
+		cw.removeProbeRoutes(baseline)
+	}
+	return verdict, portalHost, portalURL
+}
+
+// captiveVerdictName — короткое имя вердикта для лога зонда.
+func captiveVerdictName(v captiveVerdict) string {
+	switch v {
+	case captiveOpen:
+		return "open"
+	case captivePortal:
+		return "портал"
+	default:
+		return "нет ответа"
+	}
 }
 
 // captiveFallbackResolvers — публичные резолверы для подбора работающего:

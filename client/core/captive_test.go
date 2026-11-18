@@ -242,6 +242,51 @@ func TestCaptiveUnknownDoesNotSetLastProbeOrCrossGeneration(t *testing.T) {
 	}
 }
 
+func TestAggregateCaptiveResults(t *testing.T) {
+	ncsi := captiveProbeResult{verdict: captiveOpen}
+	confirmOK := captiveProbeResult{confirm: true, verdict: captiveOpen}
+	confirmBlocked := captiveProbeResult{confirm: true, verdict: captiveUnknown}
+	redirect := captiveProbeResult{verdict: captivePortal, host: "portal.example.com",
+		location: "https://portal.example.com/guest/s/x?ap=aa"}
+	hijack := captiveProbeResult{confirm: true, verdict: captivePortal, host: "auth.example.net",
+		location: "https://auth.example.net/login"}
+	hijackNoURL := captiveProbeResult{verdict: captivePortal}
+
+	cases := []struct {
+		name           string
+		results        []captiveProbeResult
+		want           captiveVerdict
+		wantHost       string
+		wantPortalPort bool // location должен дойти до агрегатора
+	}{
+		{"whitelist: NCSI ok, control host silent", []captiveProbeResult{ncsi, confirmBlocked}, captivePortal, "", false},
+		{"truly open: both ok", []captiveProbeResult{ncsi, confirmOK}, captiveOpen, "", false},
+		{"redirect on NCSI host wins with URL", []captiveProbeResult{redirect, confirmOK}, captivePortal, "portal.example.com", true},
+		{"redirect on control host", []captiveProbeResult{ncsi, hijack}, captivePortal, "auth.example.net", true},
+		{"later URL beats earlier URL-less hijack", []captiveProbeResult{hijackNoURL, redirect}, captivePortal, "portal.example.com", true},
+		{"control ok alone is open", []captiveProbeResult{confirmOK}, captiveOpen, "", false},
+		{"all silent", []captiveProbeResult{confirmBlocked, captiveProbeResult{verdict: captiveUnknown}}, captiveUnknown, "", false},
+		{"no results", nil, captiveUnknown, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, host, loc := aggregateCaptiveResults(tc.results)
+			if v != tc.want {
+				t.Fatalf("verdict = %v, want %v", v, tc.want)
+			}
+			if host != tc.wantHost {
+				t.Fatalf("host = %q, want %q", host, tc.wantHost)
+			}
+			if tc.wantPortalPort && loc == "" {
+				t.Fatalf("portal location lost in aggregation")
+			}
+			if !tc.wantPortalPort && loc != "" {
+				t.Fatalf("unexpected location %q", loc)
+			}
+		})
+	}
+}
+
 func TestCaptiveFinishOpenRequiresTwoConsecutiveAliveTicks(t *testing.T) {
 	cw := &captiveWatcher{probePaused: true}
 	if action := cw.observeTunnelLocked(true); action != captiveTunnelWait {
