@@ -20,8 +20,10 @@ package core
 //   3. /32 routes past the tunnel are added only for the probe, its DNS servers and
 //      the portal. Probe routes from an inconclusive attempt are removed again.
 //
-// A successful probe, or a tunnel with live workers, restores the DNS override and
-// removes the captive rules. The watcher and its portal state survive WG teardown
+// A successful probe restores the DNS override and removes the captive rules.
+// A tunnel with live workers does the same for redirect/silent states, but not
+// for a whitelisting portal: there workers may live while web access is still blocked.
+// The watcher and its portal state survive WG teardown
 // and reconnects; a network change, user disconnect or application shutdown clears them.
 
 import (
@@ -158,6 +160,32 @@ const (
 	captiveOpen                          // probe answered as expected — there is internet
 	captivePortal                        // probe intercepted — captive portal
 )
+
+// captivePortalKind определяет, каким доказательством разрешается выход из
+// портал-режима. Whitelist-портал пропускает служебные пробы ОС, но может ещё
+// закрывать web при уже живых tunnel-воркерах, поэтому живой туннель его не снимает.
+type captivePortalKind int
+
+const (
+	captivePortalSilent    captivePortalKind = iota // зонды молчали, портал не классифицирован
+	captivePortalRedirect                           // перехват HTTP раскрыл портал
+	captivePortalWhitelist                          // NCSI открыт, контрольный хост не ответил
+)
+
+// captivePortalKindFromResults отличает whitelist от перехвата. HTTP-hijack без
+// пригодного Location остаётся redirect-вариантом: это ответ портала, а не
+// безмолвие контрольного хоста при открытом NCSI.
+func captivePortalKindFromResults(verdict captiveVerdict, results []captiveProbeResult) captivePortalKind {
+	if verdict != captivePortal {
+		return captivePortalSilent
+	}
+	for _, r := range results {
+		if r.verdict == captivePortal {
+			return captivePortalRedirect
+		}
+	}
+	return captivePortalWhitelist
+}
 
 // classifyCaptiveProbe makes a verdict from an HTTP response:
 //   - redirect → captive, portal host is extracted from Location;
@@ -298,27 +326,31 @@ func captiveUnknownRetry(attempt int) (time.Duration, bool) {
 // ─── Process-scoped watcher ──────────────────────────────────────────────────
 
 type captiveWatcher struct {
-	mu           sync.Mutex
-	wgIface      string
-	gw           string
-	iface        string
-	generation   uint64
-	active       bool
-	lastProbe    time.Time // only a definitive open/portal verdict updates this
-	nextProbe    time.Time
-	probePaused  bool
-	unknownTry   int
-	openKnown    bool
-	aliveTicks   int
-	deadTicks    int
-	aliveTrusted bool // воркеры наблюдались мёртвыми на текущей сети
-	portalHost   string
-	portalURL    string
-	routes       map[string]bool   // added /32 via the gateway (probe, DNS, portal)
-	nrptRules    map[string]string // entry host → verified resolver
-	tunnelAlive  func() bool
-	stopCh       chan struct{}
-	doneCh       chan struct{}
+	mu              sync.Mutex
+	wgIface         string
+	gw              string
+	iface           string
+	generation      uint64
+	active          bool
+	lastProbe       time.Time // only a definitive open/portal verdict updates this
+	nextProbe       time.Time
+	probePaused     bool
+	unknownTry      int
+	openKnown       bool
+	aliveTicks      int
+	deadTicks       int
+	aliveTrusted    bool // воркеры наблюдались мёртвыми на текущей сети
+	portalHost      string
+	portalURL       string
+	portalKind      captivePortalKind
+	whitelistStreak int               // подряд идущие whitelist-вердикты зонда
+	dnsServers      []string          // DNS физической сети для proxy при мёртвом туннеле
+	sourceIP        string            // IPv4 физического интерфейса для сетевого upstream
+	routes          map[string]bool   // added /32 via the gateway (probe, DNS, portal)
+	nrptRules       map[string]string // entry host → verified resolver
+	tunnelAlive     func() bool
+	stopCh          chan struct{}
+	doneCh          chan struct{}
 }
 
 var (
@@ -392,6 +424,80 @@ func (cw *captiveWatcher) stoppedLocked() bool {
 	}
 }
 
+// captiveDNSUpstream возвращает прокси один согласованный snapshot. Сетевой
+// upstream разрешён только в captive/unknown-состоянии при мёртвом туннеле;
+// openKnown или живые воркеры сразу возвращают обычный туннельный режим.
+// tunnelAlive вызывается под тем же cw.mu, что и в tick; список копируется.
+func (cw *captiveWatcher) captiveDNSUpstream() (active bool, servers []string, sourceIP string) {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	if cw.stoppedLocked() || cw.openKnown || cw.gw == "" || cw.iface == "" {
+		return false, nil, ""
+	}
+	if cw.tunnelAlive != nil && cw.tunnelAlive() {
+		return false, nil, ""
+	}
+	if len(cw.dnsServers) == 0 || cw.sourceIP == "" {
+		// Неполный snapshot (смена сети до refreshCaptiveUpstream): сетевой
+		// upstream с пустыми данными молча уронил бы все запросы — остаётся
+		// обычный туннельный upstream.
+		return false, nil, ""
+	}
+	return true, append([]string(nil), cw.dnsServers...), cw.sourceIP
+}
+
+// refreshCaptiveUpstream обновляет данные физической сети один раз на тик, а не
+// на каждый DNS-запрос. Поколение отсекает результат чтения прежней сети.
+func (cw *captiveWatcher) refreshCaptiveUpstream(gw, iface string) {
+	cw.mu.Lock()
+	generation := cw.generation
+	valid := !cw.stoppedLocked() && gw == cw.gw && iface == cw.iface
+	cw.mu.Unlock()
+	if !valid || gw == "" || iface == "" {
+		return
+	}
+
+	servers := captiveDNSServers(iface, gw)
+	sourceIP := physicalInterfaceIPv4(iface)
+	cw.mu.Lock()
+	if !cw.stoppedLocked() && generation == cw.generation && gw == cw.gw && iface == cw.iface {
+		cw.dnsServers = append([]string(nil), servers...)
+		cw.sourceIP = sourceIP
+	}
+	cw.mu.Unlock()
+}
+
+// physicalInterfaceIPv4 возвращает IPv4, привязка к которому направляет
+// исходящий DNS-сокет через физический интерфейс, а не через WG default route.
+func physicalInterfaceIPv4(iface string) string {
+	if iface == "" {
+		return ""
+	}
+	netIf, err := net.InterfaceByName(iface)
+	if err != nil {
+		return ""
+	}
+	addrs, err := netIf.Addrs()
+	if err != nil {
+		return ""
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch a := addr.(type) {
+		case *net.IPNet:
+			ip = a.IP
+		case *net.IPAddr:
+			ip = a.IP
+		default:
+			ip, _, _ = net.ParseCIDR(addr.String())
+		}
+		if ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+			return ip.To4().String()
+		}
+	}
+	return ""
+}
+
 func (cw *captiveWatcher) loop() {
 	defer close(cw.doneCh)
 	defer cw.clearAllow()
@@ -417,7 +523,27 @@ const (
 	captiveTunnelMaintainOpen
 	captiveTunnelFinishOpen
 	captiveTunnelRecapture
+	captiveTunnelWhitelistAlive
 )
+
+// Одиночный whitelist-вердикт может быть случайным таймаутом контрольного
+// хоста; sticky-режим (не снимается живым туннелем) требует двух подряд.
+const captiveWhitelistConfirmVerdicts = 2
+
+// resolvePortalKind решает, доказан ли whitelist-портал. Остальные варианты
+// выставляются напрямую, счётчик подряд идущих whitelist-вердиктов сбрасывается.
+func resolvePortalKind(kind captivePortalKind, whitelistStreak *int) captivePortalKind {
+	if kind != captivePortalWhitelist {
+		*whitelistStreak = 0
+		return kind
+	}
+	*whitelistStreak++
+	if *whitelistStreak >= captiveWhitelistConfirmVerdicts {
+		return captivePortalWhitelist
+	}
+	// Ещё не доказан: ведёт себя как silent — снимается и живым туннелем.
+	return captivePortalSilent
+}
 
 // observeTunnelLocked updates open-network liveness streaks. Live ticks are
 // trusted only after workers were seen dead on the current network: right after
@@ -443,6 +569,13 @@ func (cw *captiveWatcher) observeTunnelLocked(alive bool) captiveTunnelAction {
 			return captiveTunnelWait
 		}
 		cw.aliveTicks = 0
+		if cw.active && cw.portalKind == captivePortalWhitelist {
+			// Воркеры могут работать через whitelist портала, пока web ещё закрыт:
+			// живой туннель не снимает режим. Но анти-лик обязателен — DNS
+			// возвращается в туннель (страница входа остаётся достижимой через
+			// свои exact-NRPT и /32), а снимает режим только open-проба.
+			return captiveTunnelWhitelistAlive
+		}
 		return captiveTunnelFinishOpen
 	}
 
@@ -479,6 +612,7 @@ func (cw *captiveWatcher) tick() {
 	if gw == "" || iface == "" {
 		return
 	}
+	cw.refreshCaptiveUpstream(gw, iface)
 
 	cw.mu.Lock()
 	if cw.stoppedLocked() {
@@ -508,9 +642,17 @@ func (cw *captiveWatcher) tick() {
 		// verdict, and tolerate a short tunnel outage before reopening probes.
 		cw.applyDNSOverride(gw, iface, generation, "подтверждённая сеть")
 		return
+	case captiveTunnelWhitelistAlive:
+		// Whitelist-портал при живом туннеле: состояние и allow-правила
+		// сохраняются (страница входа доступна через свои exact-NRPT и /32,
+		// open-проба по-прежнему может снять режим), но DNS обязан вернуться
+		// в туннель — воркеры живы, анти-лик сильнее «не мешать».
+		cw.applyDNSOverride(gw, iface, generation, "whitelist-портал, живой туннель")
+		return
 	case captiveTunnelRecapture:
 		log.Printf("[CAPTIVE] Туннель не ожил после %d тиков — DNS возвращён сети, пробы возобновлены", captiveOpenDeadTicks)
 		recaptureInterfaceDNSForCaptive(iface, gw)
+		cw.refreshCaptiveUpstream(gw, iface)
 		cw.probe(gw, iface)
 		return
 	}
@@ -547,6 +689,9 @@ func (cw *captiveWatcher) changeNetwork(gw, iface string, force bool) {
 	cw.active = false
 	cw.openKnown = false
 	cw.portalHost, cw.portalURL = "", ""
+	cw.portalKind = captivePortalSilent
+	cw.whitelistStreak = 0
+	cw.dnsServers, cw.sourceIP = nil, ""
 	cw.lastProbe = time.Time{}
 	cw.nextProbe = time.Time{}
 	cw.probePaused = false
@@ -573,13 +718,13 @@ func (cw *captiveWatcher) probe(gw, iface string) {
 	}
 	cw.mu.Unlock()
 
-	verdict, portalHost, portalURL := cw.runProbes(gw, iface, generation)
+	verdict, portalHost, portalURL, portalKind := cw.runProbes(gw, iface, generation)
 
 	switch verdict {
 	case captiveOpen:
 		cw.finishOpen(gw, iface, generation, true, "успешный зонд")
 	case captivePortal:
-		cw.enterCaptive(gw, iface, generation, portalHost, portalURL)
+		cw.enterCaptive(gw, iface, generation, portalHost, portalURL, portalKind)
 	default:
 		cw.recordUnknown(gw, iface, generation)
 	}
@@ -593,6 +738,12 @@ func (cw *captiveWatcher) recordUnknown(gw, iface string, generation uint64) {
 		return
 	}
 	cw.unknownTry++
+	if !cw.active || cw.portalKind != captivePortalWhitelist {
+		// Тишина обновляет redirect/начальное состояние, но не ослабляет уже
+		// доказанный whitelist: иначе живой туннель снова снял бы его без open-пробы.
+		cw.portalKind = captivePortalSilent
+		cw.whitelistStreak = 0 // серия whitelist-вердиктов прервана
+	}
 	delay, retry := captiveUnknownRetry(cw.unknownTry)
 	if retry {
 		cw.nextProbe = time.Now().Add(delay)
@@ -627,6 +778,9 @@ func (cw *captiveWatcher) finishOpen(gw, iface string, generation uint64, fromPr
 	cw.aliveTicks = 0
 	cw.deadTicks = 0
 	cw.portalHost, cw.portalURL = "", ""
+	cw.portalKind = captivePortalSilent
+	cw.whitelistStreak = 0
+	cw.dnsServers, cw.sourceIP = nil, ""
 	cw.mu.Unlock()
 
 	if fromProbe && firstDefinitive {
@@ -647,15 +801,15 @@ func (cw *captiveWatcher) finishOpen(gw, iface string, generation uint64, fromPr
 // в белые списки порталов). Добавляет /32 маршруты к DNS-серверам и хостам
 // зонда через шлюз. На open и unknown удаляет только маршруты, добавленные
 // этой попыткой; правила прежнего активного портала сохраняются до вердикта
-// open или живого туннеля.
-func (cw *captiveWatcher) runProbes(gw, iface string, generation uint64) (captiveVerdict, string, string) {
+// open или живого туннеля (кроме whitelist, которому нужен именно open).
+func (cw *captiveWatcher) runProbes(gw, iface string, generation uint64) (captiveVerdict, string, string, captivePortalKind) {
 	baseline := cw.routeSnapshot()
 	dnsServers := captiveDNSServers(iface, gw)
 	if gw != "" && !captiveListContains(dnsServers, gw) {
 		dnsServers = append(dnsServers, gw)
 	}
 	if len(dnsServers) == 0 {
-		return captiveUnknown, "", ""
+		return captiveUnknown, "", "", captivePortalSilent
 	}
 	for _, srv := range dnsServers {
 		cw.addAllowRoute(srv, gw, generation)
@@ -690,7 +844,7 @@ func (cw *captiveWatcher) runProbes(gw, iface string, generation uint64) (captiv
 	if verdict != captivePortal {
 		cw.removeProbeRoutes(baseline)
 	}
-	return verdict, portalHost, portalURL
+	return verdict, portalHost, portalURL, captivePortalKindFromResults(verdict, results)
 }
 
 // captiveVerdictName — короткое имя вердикта для лога зонда.
@@ -718,12 +872,21 @@ func captiveListContains(list []string, addr string) bool {
 	return false
 }
 
+// normalizeCaptiveEntryURL принимает только абсолютный http/https URL с хостом.
+// Эта же проверка выполняется перед записью .url-файла с данными портала.
+func normalizeCaptiveEntryURL(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	u, err := url.Parse(trimmed)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return "", false
+	}
+	return trimmed, true
+}
+
 // captiveEntryURL — какой адрес открывать пользователю на портальной сети.
 func captiveEntryURL(portalURL, portalHost string) string {
-	trimmed := strings.TrimSpace(portalURL)
-	if u, err := url.Parse(trimmed); err == nil &&
-		(u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != "" {
-		return trimmed
+	if normalized, ok := normalizeCaptiveEntryURL(portalURL); ok {
+		return normalized
 	}
 	if portalHost != "" && validCaptiveHost(portalHost) {
 		return "https://" + portalHost + "/"
@@ -733,7 +896,7 @@ func captiveEntryURL(portalURL, portalHost string) string {
 
 // enterCaptive activates or refreshes portal state. Newly revealed or changed
 // entry hosts are processed on every portal verdict, not only on the first one.
-func (cw *captiveWatcher) enterCaptive(gw, iface string, generation uint64, portalHost, portalURL string) {
+func (cw *captiveWatcher) enterCaptive(gw, iface string, generation uint64, portalHost, portalURL string, portalKind captivePortalKind) {
 	cw.mu.Lock()
 	if cw.stoppedLocked() || generation != cw.generation || gw != cw.gw || iface != cw.iface {
 		cw.mu.Unlock()
@@ -750,6 +913,7 @@ func (cw *captiveWatcher) enterCaptive(gw, iface string, generation uint64, port
 	portalHost = cw.portalHost
 	entryURL := cw.portalURL
 	cw.active = true
+	cw.portalKind = resolvePortalKind(portalKind, &cw.whitelistStreak)
 	cw.openKnown = false
 	cw.lastProbe = time.Now()
 	cw.nextProbe = time.Now().Add(captiveProbeEvery)
@@ -792,9 +956,9 @@ func (cw *captiveWatcher) enterCaptive(gw, iface string, generation uint64, port
 		if !cw.portalLaunchCurrent(gw, iface, generation) {
 			log.Printf("[CAPTIVE] Сеть сменилась во время подготовки портала — страница старой сети не открывается")
 		} else {
-			log.Printf("[CAPTIVE] Открываю страницу входа в Edge: %s", entry)
-			if err := launchEdgeOS(entry); err != nil {
-				log.Printf("[CAPTIVE] Не удалось открыть Edge: %v — откройте страницу входа в Edge/Firefox вручную", err)
+			log.Printf("[CAPTIVE] Открываю страницу входа в браузере по умолчанию: %s", entry)
+			if err := launchCaptivePortalOS(entry); err != nil {
+				log.Printf("[CAPTIVE] Не удалось открыть страницу входа: %v — откройте её в браузере вручную", err)
 			}
 		}
 	}
@@ -803,7 +967,7 @@ func (cw *captiveWatcher) enterCaptive(gw, iface string, generation uint64, port
 	}
 }
 
-// portalLaunchCurrent rejects a delayed Edge launch after a network epoch change.
+// portalLaunchCurrent rejects a delayed browser launch after a network epoch change.
 func (cw *captiveWatcher) portalLaunchCurrent(gw, iface string, generation uint64) bool {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()

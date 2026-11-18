@@ -242,6 +242,25 @@ func TestCaptiveUnknownDoesNotSetLastProbeOrCrossGeneration(t *testing.T) {
 	}
 }
 
+func TestCaptiveUnknownDoesNotWeakenWhitelist(t *testing.T) {
+	for _, tc := range []struct {
+		kind captivePortalKind
+		want captivePortalKind
+	}{
+		{captivePortalRedirect, captivePortalSilent},
+		{captivePortalWhitelist, captivePortalWhitelist},
+	} {
+		cw := &captiveWatcher{
+			gw: "192.0.2.1", iface: "test0", generation: 1,
+			active: true, portalKind: tc.kind, stopCh: make(chan struct{}),
+		}
+		cw.recordUnknown(cw.gw, cw.iface, 1)
+		if cw.portalKind != tc.want {
+			t.Fatalf("unknown after kind %v = %v, want %v", tc.kind, cw.portalKind, tc.want)
+		}
+	}
+}
+
 func TestAggregateCaptiveResults(t *testing.T) {
 	ncsi := captiveProbeResult{verdict: captiveOpen}
 	confirmOK := captiveProbeResult{confirm: true, verdict: captiveOpen}
@@ -284,6 +303,65 @@ func TestAggregateCaptiveResults(t *testing.T) {
 				t.Fatalf("unexpected location %q", loc)
 			}
 		})
+	}
+}
+
+func TestCaptiveWhitelistStreakRequiresTwoVerdicts(t *testing.T) {
+	streak := 0
+	if kind := resolvePortalKind(captivePortalWhitelist, &streak); kind != captivePortalSilent || streak != 1 {
+		t.Fatalf("first whitelist verdict = %v streak=%d, want silent/1", kind, streak)
+	}
+	if kind := resolvePortalKind(captivePortalWhitelist, &streak); kind != captivePortalWhitelist || streak != 2 {
+		t.Fatalf("second whitelist verdict = %v streak=%d, want whitelist/2", kind, streak)
+	}
+	// Перебитый другим вердиктом счётчик сбрасывается.
+	if kind := resolvePortalKind(captivePortalRedirect, &streak); kind != captivePortalRedirect || streak != 0 {
+		t.Fatalf("redirect verdict = %v streak=%d, want redirect/0", kind, streak)
+	}
+	if kind := resolvePortalKind(captivePortalWhitelist, &streak); kind != captivePortalSilent || streak != 1 {
+		t.Fatalf("whitelist after reset = %v streak=%d, want silent/1", kind, streak)
+	}
+}
+
+func TestCaptiveWhitelistAliveKeepsStateButRestoresProxy(t *testing.T) {
+	cw := &captiveWatcher{active: true, portalKind: captivePortalWhitelist, aliveTrusted: true}
+	if action := cw.observeTunnelLocked(true); action != captiveTunnelWait {
+		t.Fatalf("first trusted alive in whitelist = %v, want wait", action)
+	}
+	action := cw.observeTunnelLocked(true)
+	if action != captiveTunnelWhitelistAlive {
+		t.Fatalf("second trusted alive in whitelist = %v, want whitelistAlive", action)
+	}
+	if !cw.active || cw.portalKind != captivePortalWhitelist || cw.probePaused {
+		t.Fatalf("whitelistAlive must keep portal state for the open probe: active=%v kind=%v paused=%v",
+			cw.active, cw.portalKind, cw.probePaused)
+	}
+	// Контроль: тот же сценарий без whitelist даёт finishOpen.
+	cw2 := &captiveWatcher{active: true, portalKind: captivePortalSilent, aliveTrusted: true}
+	if action := cw2.observeTunnelLocked(true); action != captiveTunnelWait {
+		t.Fatalf("first alive non-whitelist = %v, want wait", action)
+	}
+	if action := cw2.observeTunnelLocked(true); action != captiveTunnelFinishOpen {
+		t.Fatalf("second alive non-whitelist = %v, want finishOpen", action)
+	}
+}
+
+func TestCaptiveDNSUpstreamIncompleteSnapshot(t *testing.T) {
+	cw := &captiveWatcher{gw: "192.0.2.1", iface: "eth", dnsServers: []string{"192.0.2.53"}, sourceIP: "192.0.2.10"}
+	active, _, _ := cw.captiveDNSUpstream()
+	if !active {
+		t.Fatal("complete snapshot should activate captive upstream")
+	}
+	cw.dnsServers = nil
+	active, _, _ = cw.captiveDNSUpstream()
+	if active {
+		t.Fatal("empty servers snapshot must not activate captive upstream")
+	}
+	cw.dnsServers = []string{"192.0.2.53"}
+	cw.sourceIP = ""
+	active, _, _ = cw.captiveDNSUpstream()
+	if active {
+		t.Fatal("empty sourceIP snapshot must not activate captive upstream")
 	}
 }
 
@@ -334,10 +412,17 @@ func TestCaptiveStaleLivenessNotTrustedUntilDeadTick(t *testing.T) {
 }
 
 func TestCaptiveNetworkChangeResetsLivenessTrust(t *testing.T) {
-	cw := &captiveWatcher{gw: "192.0.2.1", iface: "eth", aliveTrusted: true}
+	cw := &captiveWatcher{
+		gw: "192.0.2.1", iface: "eth", aliveTrusted: true,
+		portalKind: captivePortalWhitelist,
+		dnsServers: []string{"192.0.2.53"}, sourceIP: "192.0.2.10",
+	}
 	cw.changeNetwork("192.0.2.9", "eth", false)
 	if cw.aliveTrusted {
 		t.Fatal("network change did not reset liveness trust")
+	}
+	if cw.portalKind != captivePortalSilent || cw.dnsServers != nil || cw.sourceIP != "" {
+		t.Fatalf("network change left portal/DNS state: kind=%v servers=%v source=%q", cw.portalKind, cw.dnsServers, cw.sourceIP)
 	}
 	if action := cw.observeTunnelLocked(true); action != captiveTunnelWait {
 		t.Fatalf("alive after network change = %v, want wait (stale workers)", action)
@@ -433,6 +518,107 @@ func TestCaptivePortalLaunchRejectsStaleGeneration(t *testing.T) {
 	cw.active = false
 	if cw.portalLaunchCurrent(cw.gw, cw.iface, 4) {
 		t.Fatal("inactive portal launch accepted")
+	}
+}
+
+func TestCaptivePortalKindFromResults(t *testing.T) {
+	ncsi := captiveProbeResult{verdict: captiveOpen}
+	confirmSilent := captiveProbeResult{confirm: true, verdict: captiveUnknown}
+	redirect := captiveProbeResult{verdict: captivePortal, location: "https://portal.example.com/login"}
+	hijackWithoutURL := captiveProbeResult{verdict: captivePortal}
+
+	cases := []struct {
+		name    string
+		verdict captiveVerdict
+		results []captiveProbeResult
+		want    captivePortalKind
+	}{
+		{"whitelist", captivePortal, []captiveProbeResult{ncsi, confirmSilent}, captivePortalWhitelist},
+		{"redirect", captivePortal, []captiveProbeResult{redirect}, captivePortalRedirect},
+		{"hijack is still an answered portal", captivePortal, []captiveProbeResult{hijackWithoutURL}, captivePortalRedirect},
+		{"silent", captiveUnknown, nil, captivePortalSilent},
+		{"open", captiveOpen, []captiveProbeResult{ncsi}, captivePortalSilent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := captivePortalKindFromResults(tc.verdict, tc.results); got != tc.want {
+				t.Fatalf("kind = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCaptiveWhitelistDoesNotExitOnLiveTunnel(t *testing.T) {
+	cw := &captiveWatcher{
+		active: true, portalKind: captivePortalWhitelist, aliveTrusted: true,
+	}
+	// Первый тик — ожидание; второй возвращает whitelistAlive: портал сохранён
+	// (openKnown не взводится), но tick обязан вернуть DNS в туннель.
+	for tick := 1; tick < captiveOpenAliveTicks; tick++ {
+		if action := cw.observeTunnelLocked(true); action != captiveTunnelWait {
+			t.Fatalf("whitelist alive tick %d action = %v, want wait", tick, action)
+		}
+	}
+	if action := cw.observeTunnelLocked(true); action != captiveTunnelWhitelistAlive {
+		t.Fatalf("whitelist alive tick %d action = %v, want whitelistAlive", captiveOpenAliveTicks, action)
+	}
+	if !cw.active || cw.openKnown {
+		t.Fatalf("live tunnel cleared whitelist: active=%v open=%v", cw.active, cw.openKnown)
+	}
+}
+
+func TestCaptiveRedirectAndSilentExitOnLiveTunnel(t *testing.T) {
+	for _, kind := range []captivePortalKind{captivePortalRedirect, captivePortalSilent} {
+		cw := &captiveWatcher{active: true, portalKind: kind, aliveTrusted: true}
+		if action := cw.observeTunnelLocked(true); action != captiveTunnelWait {
+			t.Fatalf("kind %v first alive action = %v, want wait", kind, action)
+		}
+		if action := cw.observeTunnelLocked(true); action != captiveTunnelFinishOpen {
+			t.Fatalf("kind %v second alive action = %v, want finishOpen", kind, action)
+		}
+	}
+}
+
+func TestCaptiveDNSUpstreamSnapshot(t *testing.T) {
+	alive := false
+	cw := &captiveWatcher{
+		gw: "192.0.2.1", iface: "test0",
+		dnsServers: []string{"192.0.2.53"}, sourceIP: "192.0.2.10",
+		tunnelAlive: func() bool { return alive },
+		stopCh:      make(chan struct{}),
+	}
+	active, servers, sourceIP := cw.captiveDNSUpstream()
+	if !active || sourceIP != "192.0.2.10" || len(servers) != 1 || servers[0] != "192.0.2.53" {
+		t.Fatalf("dead unknown snapshot = active=%v servers=%v source=%q", active, servers, sourceIP)
+	}
+	servers[0] = "198.51.100.53"
+	_, servers, _ = cw.captiveDNSUpstream()
+	if servers[0] != "192.0.2.53" {
+		t.Fatalf("snapshot shares DNS slice: %v", servers)
+	}
+
+	alive = true
+	if active, _, _ := cw.captiveDNSUpstream(); active {
+		t.Fatal("network DNS remained active with a live tunnel")
+	}
+	alive = false
+	cw.openKnown = true
+	if active, _, _ := cw.captiveDNSUpstream(); active {
+		t.Fatal("network DNS remained active on an open network")
+	}
+}
+
+func TestNormalizeCaptiveEntryURL(t *testing.T) {
+	if got, ok := normalizeCaptiveEntryURL("  https://portal.example.com/login?a=b  "); !ok || got != "https://portal.example.com/login?a=b" {
+		t.Fatalf("valid URL = %q, %v", got, ok)
+	}
+	for _, raw := range []string{
+		"", "ftp://portal.example.com/", "//portal.example.com/login",
+		"http://portal.example.com/\r\nURL=http://evil.example.com/",
+	} {
+		if got, ok := normalizeCaptiveEntryURL(raw); ok {
+			t.Fatalf("invalid URL %q accepted as %q", raw, got)
+		}
 	}
 }
 

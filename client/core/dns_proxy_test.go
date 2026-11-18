@@ -53,6 +53,41 @@ func answerTypes(t *testing.T, resp []byte) (uint16, []uint16) {
 	return qtype, types
 }
 
+func TestDNSProxyCaptiveUpstreamSelection(t *testing.T) {
+	p := newDNSProxy([]string{"8.8.8.8", "1.1.1.1"}, "10.66.0.2")
+	active := true
+	networkServers := []string{"192.0.2.53", "127.0.0.1", "2001:db8::53"}
+	p.SetCaptiveUpstreamHandler(func() (bool, []string, string) {
+		return active, networkServers, "192.0.2.10"
+	})
+
+	cfg := p.selectUpstream()
+	if !cfg.captive || cfg.sourceIP != "192.0.2.10" || len(cfg.servers) != 1 || cfg.servers[0] != "192.0.2.53" {
+		t.Fatalf("captive config = %+v", cfg)
+	}
+	cfg.servers[0] = "198.51.100.53"
+	if again := p.selectUpstream(); again.servers[0] != "192.0.2.53" {
+		t.Fatalf("proxy retained caller's DNS slice: %v", again.servers)
+	}
+
+	active = false
+	cfg = p.selectUpstream()
+	if cfg.captive || cfg.sourceIP != "10.66.0.2" || len(cfg.servers) != 2 || cfg.servers[0] != "8.8.8.8" {
+		t.Fatalf("normal config after captive = %+v", cfg)
+	}
+}
+
+func TestDNSProxyCaptiveRequiresPhysicalSource(t *testing.T) {
+	p := newDNSProxy([]string{"192.0.2.53"}, "10.66.0.2")
+	query := dnsQuery("portal.example.com", dnsTypeA)
+	if _, err := p.forwardDNS(query, "192.0.2.53", "", true); err == nil {
+		t.Fatal("captive DNS without physical source IP was not rejected")
+	}
+	if _, err := p.forwardDNS(query, "192.0.2.53", "not-an-ip", true); err == nil {
+		t.Fatal("captive DNS with invalid source IP was not rejected")
+	}
+}
+
 func TestBuildDNSResponseCountsOnlyIPv4(t *testing.T) {
 	q := dnsQuery("rasp.yandex.ru", dnsTypeA)
 	resp := buildDNSResponseWithA(q, []net.IP{net.ParseIP("87.250.250.158"), net.ParseIP("2a02:6b8::2:242")})

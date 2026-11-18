@@ -369,6 +369,13 @@ func SetupWindowsWireGuard(rawConf, ifaceName string, customDNS []string, exclud
 		}
 		log.Printf("[DNS] Source IP для upstream=%s (origIface=%q)", srcIP, origIface)
 		proxy := newDNSProxy(customDNS, srcIP)
+		proxy.SetCaptiveUpstreamHandler(func() (bool, []string, string) {
+			cw := currentCaptiveWatcher()
+			if cw == nil {
+				return false, nil, ""
+			}
+			return cw.captiveDNSUpstream()
+		})
 		if err := proxy.Start(); err != nil {
 			log.Printf("[DNS] Не удалось запустить локальный прокси: %v (возможно, порт 53 занят)", err)
 		} else {

@@ -24,14 +24,22 @@ import (
 // который используется как source IP для исходящих DNS-запросов к upstream.
 // Это гарантирует, что пакеты идут через туннель (default route 0.0.0.0/0 → WDTT),
 // а не через локальный Ethernet напрямую (где 8.8.8.8 заблокирован ISP).
+type dnsUpstreamConfig struct {
+	servers  []string
+	sourceIP string
+	captive  bool
+}
+
 type dnsProxy struct {
 	listener net.PacketConn
 	upstream []string
 	sourceIP string
 	timeout  time.Duration
 
-	mu      sync.Mutex
-	running bool
+	mu              sync.Mutex
+	running         bool
+	captiveUpstream func() (active bool, servers []string, sourceIP string)
+	captiveMode     bool
 
 	queries   atomic.Uint64
 	forwards  atomic.Uint64
@@ -68,6 +76,51 @@ func (p *dnsProxy) SetExcludedDomainHandler(fn func(hostname string) []net.IP) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.onExcludedDomain = fn
+}
+
+// SetCaptiveUpstreamHandler задаёт источник атомарного snapshot'а сетевого DNS.
+// Пока captive-вотчер видит неподтверждённую сеть и мёртвый туннель, прокси
+// использует DNS физической сети вместо заведомо неработающего туннеля.
+func (p *dnsProxy) SetCaptiveUpstreamHandler(fn func() (active bool, servers []string, sourceIP string)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.captiveUpstream = fn
+}
+
+// selectUpstream выбирает upstream на один DNS-запрос. Callback вызывается без
+// p.mu: вотчер защищает snapshot собственным mutex'ом. Список копируется и здесь,
+// чтобы дальнейшие изменения источника не затронули уже выполняемый запрос.
+func (p *dnsProxy) selectUpstream() dnsUpstreamConfig {
+	p.mu.Lock()
+	cfg := dnsUpstreamConfig{
+		servers:  append([]string(nil), p.upstream...),
+		sourceIP: p.sourceIP,
+	}
+	callback := p.captiveUpstream
+	p.mu.Unlock()
+
+	if callback != nil {
+		active, servers, sourceIP := callback()
+		if active {
+			cfg = dnsUpstreamConfig{
+				servers:  sanitizeDNSServers(servers, ""),
+				sourceIP: sourceIP,
+				captive:  true,
+			}
+		}
+	}
+
+	p.mu.Lock()
+	if p.captiveMode != cfg.captive {
+		p.captiveMode = cfg.captive
+		if cfg.captive {
+			log.Printf("[DNS] Upstream переключён на DNS физической сети: servers=%v sourceIP=%s", cfg.servers, cfg.sourceIP)
+		} else {
+			log.Printf("[DNS] Upstream возвращён к туннелю: servers=%v sourceIP=%s", cfg.servers, cfg.sourceIP)
+		}
+	}
+	p.mu.Unlock()
+	return cfg
 }
 
 // Start запускает прокси на :53 (UDP, все интерфейсы — ловит и 127.0.0.1,
@@ -185,6 +238,8 @@ func (p *dnsProxy) handleQuery(query []byte, clientAddr net.Addr) {
 		}
 	}
 
+	upstream := p.selectUpstream()
+
 	type result struct {
 		server string
 		resp   []byte
@@ -192,17 +247,17 @@ func (p *dnsProxy) handleQuery(query []byte, clientAddr net.Addr) {
 	}
 	// Буферизованный канал: даже если мы уже вернули ответ, фоновые
 	// горутины смогут отправить свой результат и завершиться.
-	ch := make(chan result, len(p.upstream))
+	ch := make(chan result, len(upstream.servers))
 
-	for _, server := range p.upstream {
+	for _, server := range upstream.servers {
 		p.forwards.Add(1)
 		go func(server string) {
-			resp, err := p.forward(query, server)
+			resp, err := p.forwardDNS(query, server, upstream.sourceIP, upstream.captive)
 			ch <- result{server, resp, err}
 		}(server)
 	}
 
-	pending := len(p.upstream)
+	pending := len(upstream.servers)
 	timeoutCh := time.After(p.timeout)
 	for pending > 0 {
 		select {
@@ -230,24 +285,34 @@ func (p *dnsProxy) handleQuery(query []byte, clientAddr net.Addr) {
 	p.failures.Add(1)
 }
 
-// forward отправляет DNS-запрос на один upstream UDP-сервер и ждёт ответ.
-// Если задан sourceIP — биндим исходящий сокет на него, чтобы пакет
-// гарантированно ушёл через WireGuard-интерфейс (default route), а не
-// через локальный Ethernet (где 8.8.8.8 может быть заблокирован ISP).
+// forward отправляет DNS-запрос через обычный (туннельный) upstream.
 func (p *dnsProxy) forward(query []byte, server string) ([]byte, error) {
+	return p.forwardDNS(query, server, p.sourceIP, false)
+}
+
+// forwardDNS отправляет DNS-запрос на один upstream UDP-сервер и ждёт ответ.
+// В обычном режиме sourceIP — адрес WG; при неготовности интерфейса сохранён
+// прежний fallback на автоматический выбор. В captive-режиме sourceIP обязателен
+// и fallback запрещён: запрос либо привязан к физическому интерфейсу, либо падает.
+func (p *dnsProxy) forwardDNS(query []byte, server, sourceIP string, captive bool) ([]byte, error) {
 	rAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(server, "53"))
 	if err != nil {
 		return nil, err
 	}
 	var upstream *net.UDPConn
-	if p.sourceIP != "" {
-		lAddr := &net.UDPAddr{IP: net.ParseIP(p.sourceIP), Port: 0}
+	if sourceIP != "" {
+		source := net.ParseIP(sourceIP)
+		if source == nil {
+			return nil, fmt.Errorf("invalid source IP %q", sourceIP)
+		}
+		lAddr := &net.UDPAddr{IP: source, Port: 0}
 		upstream, err = net.DialUDP("udp", lAddr, rAddr)
-		if err != nil {
+		if err != nil && !captive {
 			// WDTT-интерфейс мог быть ещё не готов при первом запросе после старта.
-			// Фоллбек на авто-выбор source IP (OS подберёт по routing table).
 			upstream, err = net.DialUDP("udp", nil, rAddr)
 		}
+	} else if captive {
+		return nil, fmt.Errorf("captive: нет source IP физического интерфейса")
 	} else {
 		upstream, err = net.DialUDP("udp", nil, rAddr)
 	}
@@ -404,4 +469,3 @@ func buildDNSResponseWithA(query []byte, ips []net.IP) []byte {
 
 	return resp
 }
-

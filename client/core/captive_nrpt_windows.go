@@ -9,13 +9,12 @@ package core
 // elevated (wintun/routes), so NRPT is available to it.
 
 import (
-	"errors"
 	"fmt"
-	"log"
 	"net"
-	"net/url"
-	"os/exec"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 )
 
 // nrptAddRule adds one host rule with the captive tag used for later removal.
@@ -80,27 +79,36 @@ func flushSystemDNSCacheOS() {
 	_ = hiddenCmd("ipconfig", "/flushdns").Run()
 }
 
-// launchEdgeOS opens Edge through the shell's microsoft-edge: protocol handler.
-// The already-running explorer.exe launches it in the logged-in user's context,
-// rather than inheriting this elevated client's token. The untrusted redirect
-// URL is one CreateProcess argument; no cmd shell or elevated Edge fallback is used.
-func launchEdgeOS(entryURL string) error {
-	entryURL = strings.TrimSpace(entryURL)
-	u, err := url.Parse(entryURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
-		return fmt.Errorf("captive: отклонён URL страницы входа %q", entryURL)
+// launchCaptivePortalOS opens the validated login URL in the default browser.
+// Explorer receives only our generated .url path as one argument: no URL scheme
+// with colons is parsed by Explorer, no shell is involved, and the browser starts
+// in the logged-in user's context rather than with this elevated client's token.
+func launchCaptivePortalOS(entryURL string) error {
+	normalized, ok := normalizeCaptiveEntryURL(entryURL)
+	if !ok {
+		return fmt.Errorf("captive: отклонён URL страницы входа %q", strings.TrimSpace(entryURL))
 	}
-	cmd := hiddenCmd("explorer.exe", "microsoft-edge:"+entryURL)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			// explorer often exits with 1 after successfully handing the URL to
-			// the shell. Once it started, its exit code does not prove Edge failed.
-			log.Printf("[CAPTIVE] explorer принял URL и завершился с кодом %d (штатная передача в shell)", exitErr.ExitCode())
-			return nil
-		}
-		return fmt.Errorf("explorer microsoft-edge: %w; output=%s", err, strings.TrimSpace(string(out)))
+
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("captive-login-%d.url", time.Now().UnixNano()))
+	contents := []byte("[InternetShortcut]\r\nURL=" + normalized + "\r\n")
+	if err := os.WriteFile(path, contents, 0600); err != nil {
+		return fmt.Errorf("captive: запись ярлыка страницы входа: %w", err)
 	}
+
+	cmd := hiddenCmd("explorer.exe", path)
+	if err := cmd.Start(); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("explorer .url: %w", err)
+	}
+	// Успех — именно запуск shell-процесса. Его последующий код выхода (в том
+	// числе 1 у explorer) ничего не говорит о том, открылся ли браузер.
+	_ = cmd.Process.Release()
+	go func() {
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+		<-timer.C
+		_ = os.Remove(path)
+	}()
 	return nil
 }
 

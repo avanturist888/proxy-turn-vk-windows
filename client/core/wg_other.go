@@ -41,5 +41,5 @@ func nrptRemoveRule(namespace string) error { return nil }
 
 func flushSystemDNSCacheOS() {}
 
-// launchEdgeOS — заглушка на не-Windows: Edge открывается только там.
-func launchEdgeOS(entryURL string) error { return nil }
+// launchCaptivePortalOS — заглушка на не-Windows: системный браузер открывается только там.
+func launchCaptivePortalOS(entryURL string) error { return nil }
